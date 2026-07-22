@@ -100,17 +100,22 @@ def reconstruct_all_atom(
         names = tmpl["names"]
         tcoords = tmpl["coords"]  # (N, 3) 模板坐标
 
-        # 找模板的 P / C1' / C4' 三个锚点
+        # 找模板的 P / C1' / C4' / O3' 四个锚点
+        # P1 修: 加 O3' 锚点 (磷酸桥几何), 让重建时 O3' 位置跟相邻残基 P 协调,
+        #        避免 O3' 被模板继承时跟下一残基 P 压成灾难性几何 (C3'-O3'-P 偏 70°)
         idx_P = names.index("P")
         idx_C1 = names.index("C1'")
         idx_C4 = names.index("C4'")
-        src_three = np.stack([tcoords[idx_P], tcoords[idx_C1], tcoords[idx_C4]])
+        idx_O3 = names.index("O3'")
+        src_anchors = np.stack([tcoords[idx_P], tcoords[idx_C1],
+                                tcoords[idx_C4], tcoords[idx_O3]])
 
-        # CG 只给 P[i], C1'/C4' 的目标位置用局部坐标系推 (近似 A-form 几何):
+        # CG 只给 P[i], C1'/C4'/O3' 的目标位置用局部坐标系推 (近似 A-form 几何):
         #   backbone 方向 b = P[i+1] - P[i] (末位用 P[0]-P[L-1])
         #   径向 r = P[i] - centroid (碱基朝外)
         #   C1' 在 P 沿 backbone 方向 +5.5Å、径向 +1.5Å 处 (A-form 统计)
         #   C4' 在 P 沿 backbone +4.2Å、径向 0 处
+        #   O3' 在 P[i+1] 反推 -1.6Å (A-form O3'-P 键长 1.6Å)
         nxt = p_coords[(i + 1) % L]
         b = nxt - p_coords[i]
         bn = np.linalg.norm(b)
@@ -124,10 +129,11 @@ def reconstruct_all_atom(
 
         c1_dst = p_coords[i] + b * 5.5 + r * 1.5
         c4_dst = p_coords[i] + b * 4.2
-        dst_three = np.stack([p_coords[i], c1_dst, c4_dst])
+        o3_dst = nxt - b * 1.6  # O3'[i] 跟 P[i+1] 几何协调
+        dst_anchors = np.stack([p_coords[i], c1_dst, c4_dst, o3_dst])
 
-        # Kabsch 叠加
-        aligned = _kabsch_align(src_three, dst_three, tcoords)
+        # Kabsch 叠加 (4 点最小二乘, 比 3 点多一个 O3' 约束)
+        aligned = _kabsch_align(src_anchors, dst_anchors, tcoords)
 
         # 写入 structure
         res_name = base

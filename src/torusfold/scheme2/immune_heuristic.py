@@ -13,6 +13,88 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 
+def _freesasa_per_residue(structure, L: int) -> np.ndarray:
+    """FreeSASA ShrakeRupley 算 per-residue SASA (Å²)。
+
+    全原子坐标喂给 FreeSASA, 按 residueNumber 聚合。
+    失败 (库缺失/坐标异常) 返回 None, 调用方回退 C1' 最近邻代理。
+    """
+    try:
+        import freesasa  # type: ignore
+    except ImportError:
+        return None
+
+    try:
+        atom_names = [a.atom_name for a in structure.atoms]
+        res_names = [a.res_name for a in structure.atoms]
+        res_nums = [str(a.res_seq) for a in structure.atoms]
+        chains = ['A'] * len(structure.atoms)
+        xs = [float(a.xyz[0]) for a in structure.atoms]
+        ys = [float(a.xyz[1]) for a in structure.atoms]
+        zs = [float(a.xyz[2]) for a in structure.atoms]
+
+        struct = freesasa.Structure()
+        struct.addAtoms(atom_names, res_names, res_nums, chains, xs, ys, zs)
+        classifier = freesasa.Classifier()
+        struct.setRadiiWithClassifier(classifier)
+        result = freesasa.calc(struct)
+
+        # residueAreas: {chain: {resNum_str: ResidueArea}}
+        res_areas = result.residueAreas()
+        sasa = np.zeros(L, dtype=np.float32)
+        chain_areas = res_areas.get('A', {})
+        for i in range(L):
+            ra = chain_areas.get(str(i + 1))
+            if ra is not None:
+                sasa[i] = float(ra.total)
+        return sasa
+    except Exception:
+        return None
+
+
+def _c1p_nn_sasa(structure, L: int) -> np.ndarray:
+    """C1' 最近邻距离代理 SASA (回退用, 暴露越大值越大)。"""
+    c1_xyzs = np.array([
+        structure.atoms[structure.residue_atom_index[i]["C1'"]].xyz
+        for i in range(L)
+    ], dtype=np.float64)
+    if L > 1:
+        d = np.linalg.norm(c1_xyzs[:, None] - c1_xyzs[None], axis=2)
+        np.fill_diagonal(d, 1e9)
+        return np.clip(d.min(axis=1) / 15.0, 0.0, 1.0).astype(np.float32)
+    return np.ones(L, dtype=np.float32)
+
+
+def _extract_stem_segments(pairs: List[Tuple[int, int, float]],
+                           L: int) -> List[Tuple[int, int]]:
+    """从 ViennaRNA 配对提取连续配对段 (stem)。
+
+    返回 [(stem_len, n_pairs), ...] 每段的长度与配对数。
+    连续配对: 相邻 i 链残基配对到相邻 j 链残基 (i+1 配 j-1)。
+    """
+    if not pairs:
+        return []
+    # 建 i→j 映射
+    pair_map = {}
+    for i, j, _w in pairs:
+        if 0 <= i < L and 0 <= j < L:
+            pair_map[i] = j
+    sorted_i = sorted(pair_map.keys())
+    segments = []
+    cur_len = 1
+    for k in range(1, len(sorted_i)):
+        prev_i, cur_i = sorted_i[k - 1], sorted_i[k]
+        prev_j, cur_j = pair_map[prev_i], pair_map[cur_i]
+        # 连续: i+1, j-1 (反向平行配对)
+        if cur_i == prev_i + 1 and cur_j == prev_j - 1:
+            cur_len += 1
+        else:
+            segments.append((cur_len, cur_len))
+            cur_len = 1
+    segments.append((cur_len, cur_len))
+    return segments
+
+
 def compute_immune_fingerprints(
     coords_aa: np.ndarray,
     structure,
@@ -39,25 +121,28 @@ def compute_immune_fingerprints(
         for i in range(L)
     ], dtype=np.float64)
 
-    # --- stem/loop (从 ViennaRNA pairs 推导) ---
+    # --- stem/loop 标记 (供 m6a drach_in_loop 用) ---
     paired = set()
     for (i, j, w) in pairs:
         if 0 <= i < L:
             paired.add(i)
         if 0 <= j < L:
             paired.add(j)
-    is_stem = np.array([1.0 if i in paired else 0.0 for i in range(L)],
-                       dtype=np.float32)
 
-    # --- PKR SASA exposure (C1'-C1' 最近邻距离 / 15 归一, 暴露越大值越大) ---
-    if L > 1:
-        d = np.linalg.norm(c1_xyzs[:, None] - c1_xyzs[None], axis=2)
-        np.fill_diagonal(d, 1e9)
-        pkr_sasa = np.clip(d.min(axis=1) / 15.0, 0.0, 1.0).astype(np.float32)
+    # --- PKR SASA exposure (FreeSASA 真 SASA, 回退 C1' 最近邻代理) ---
+    sasa_free = _freesasa_per_residue(structure, L)
+    if sasa_free is not None:
+        # 归一化到 [0,1]: 全暴露 ~350-400 Å², 全埋 ~50-100 Å²
+        pkr_sasa = np.clip((sasa_free - 50.0) / 300.0, 0.0, 1.0).astype(np.float32)
     else:
-        pkr_sasa = np.ones(L, dtype=np.float32)
+        pkr_sasa = _c1p_nn_sasa(structure, L)
 
-    pkr_stem_logit = is_stem.copy()
+    # --- pkr_stem_logit: 长茎 (>10bp) 比例 (PKR 激活需长茎 dsRNA) ---
+    stem_segments = _extract_stem_segments(pairs, L)
+    long_stem_bases = sum(s[0] for s in stem_segments if s[0] > 10)
+    paired_count = sum(s[1] for s in stem_segments)
+    pkr_stem_logit = np.full(L, min(1.0, long_stem_bases / max(1, L)),
+                             dtype=np.float32) if paired_count > 0 else np.zeros(L, dtype=np.float32)
 
     # --- m6A: DRACH motif 检测 ---
     drach_is = np.zeros(L, dtype=np.float32)
@@ -73,7 +158,7 @@ def compute_immune_fingerprints(
             drach_is[i] = 1.0
             if i not in paired:
                 drach_in_loop[i] = 1.0
-            # 暴露 + loop 区 → 高写入概率 (启发式)
+            # 暴露 (FreeSASA) + loop 区 → 高写入概率 (启发式加权)
             m6a_prob[i] = (0.5
                            + 0.3 * drach_in_loop[i]
                            + 0.2 * pkr_sasa[i])
@@ -85,26 +170,56 @@ def compute_immune_fingerprints(
         window = sequence[lo:hi]
         tlr7[i] = sum(1 for c in window if c in "GU") / len(window)
 
-    # --- RIG-I: 负对照, 只在首末残基给低值 (RIG-I 识双链, scheme2 单链无源) ---
+    # --- RIG-I: 短 dsRNA (<30bp) 识别, 从 stem 段长度派生 ---
+    # RIG-I 识别短双链 RNA (典型 10-30bp), circRNA 内部短茎激活 RIG-I
+    # per-residue: 在短茎段 (>5bp 且 <30bp) 上的残基给激活值
     rigi_per = np.zeros(L, dtype=np.float32)
-    if L > 0:
-        rigi_per[0] = 0.1
-        rigi_per[-1] = 0.1
+    if stem_segments:
+        # 重建 i→j, 找出每段覆盖的残基
+        pair_map = {}
+        for i, j, _w in pairs:
+            if 0 <= i < L and 0 <= j < L:
+                pair_map[i] = j
+        sorted_i = sorted(pair_map.keys())
+        seg_starts = []
+        if sorted_i:
+            seg_start = sorted_i[0]
+            for k in range(1, len(sorted_i)):
+                prev_i, cur_i = sorted_i[k - 1], sorted_i[k]
+                prev_j, cur_j = pair_map[prev_i], pair_map[cur_i]
+                if not (cur_i == prev_i + 1 and cur_j == prev_j - 1):
+                    seg_starts.append((seg_start, sorted_i[k - 1]))
+                    seg_start = cur_i
+            seg_starts.append((seg_start, sorted_i[-1]))
+        for seg_idx, (s, e) in enumerate(seg_starts):
+            seg_len = e - s + 1
+            if 5 < seg_len < 30:
+                j_end = pair_map[s]
+                j_start = pair_map[e]
+                # 激活强度随段长增加 (饱和)
+                activation = min(1.0, seg_len / 20.0)
+                for idx in range(s, e + 1):
+                    rigi_per[idx] = activation
+                for idx in range(min(j_start, j_end), max(j_start, j_end) + 1):
+                    rigi_per[idx] = activation
+    rigi_score = float(rigi_per.mean())
 
-    # --- NLRP3: persistence length (回转半径 / 10, 启发式) ---
-    if L > 2:
-        rg = float(np.sqrt(
-            ((c1_xyzs - c1_xyzs.mean(axis=0)) ** 2).sum(axis=1).mean()
-        ))
-        nlrp3_persist = float(np.clip(rg / 10.0, 0.0, 100.0))
+    # --- NLRP3: 长 dsRNA (>19bp) 持续长度, 从 stem 段派生 ---
+    # NLRP3 识别较长 dsRNA (>19bp), persistence_length 取最长 stem 段长
+    if stem_segments:
+        longest_stem = max(s[0] for s in stem_segments)
+        nlrp3_persist = float(min(1.0, longest_stem / 30.0))
     else:
         nlrp3_persist = 0.0
 
-    # --- miRNA sponge: GU 含量 × 长度因子 ---
-    gu_frac = sum(1 for c in sequence if c in "GU") / max(1, L)
-    sponge_score = float(gu_frac * min(L / 200.0, 1.0))
-
-    rigi_score = float(rigi_per.sum() / max(1, L))
+    # --- miRNA sponge: 真版 miRBase duplex 评估 (失败回退 GU 含量代理) ---
+    try:
+        from .mirna_sponge import compute_sponge, DEFAULT_MATURE_FA
+        sponge_result = compute_sponge(sequence, DEFAULT_MATURE_FA)
+        sponge_score = float(sponge_result["sponge_score"])
+    except Exception:
+        gu_frac = sum(1 for c in sequence if c in "GU") / max(1, L)
+        sponge_score = float(gu_frac * min(L / 200.0, 1.0))
 
     return {
         # per-residue (长度 L)

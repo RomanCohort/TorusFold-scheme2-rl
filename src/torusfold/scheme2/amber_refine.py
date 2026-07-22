@@ -51,6 +51,9 @@ P_MAX_DRIFT_A = 10.0
 # χ: O4'-C1'-N9-C4 (嘌呤) / O4'-C1'-N1-C2 (嘧啶) ~ -160° (anti)
 _AFORM_TORSIONS = {
     "alpha": (-60.0, "O3'", "P",   "O5'", "C5'"),
+    # beta 不加: 诊断发现 beta 偏 A-form 51°, 但强加 beta 约束 (k=50) 跟 alpha 共享
+    # P/O5'/C5' 三原子, 约束耦合冲突, alpha/gamma 全崩 (16/18 离群). beta 偏差记为
+    # 已知盲区, 留以后用更弱 k 或 fragment 重建处理. (tests/torsion_stacking_diag.py)
     "gamma": (60.0,  "O5'", "C5'", "C4'", "C3'"),
     "delta": (84.0,  "C5'", "C4'", "C3'", "O3'"),
     "zeta":  (-90.0, "C4'", "C3'", "O3'", "P"),
@@ -323,6 +326,8 @@ def amber_refine(
     coding_mask: Optional[np.ndarray] = None,
     cg_coords: Optional[np.ndarray] = None,
     coding_restraint_k: float = 10000.0,
+    use_o3p_bond: bool = False,
+    use_o3p_angle: bool = False,
 ) -> Tuple[np.ndarray, float, float, Dict[str, int]]:
     """Amber14 OL3 + OBC1 约束最小化。失败时返回重建坐标 (无精修)。
 
@@ -331,6 +336,9 @@ def amber_refine(
     cg_coords: (L, 3) nm, coding 钉死的目标坐标 (CG 原坐标)。
         不传时用 structure 里的 P 坐标 (即 RL 优化后的位置, 等于没钉死)。
     coding_restraint_k: coding 钉死力常数 (kJ/mol/nm²)。默认 10000 = 强钉死。
+    use_o3p_bond: P2 键长约束 (O3'-P[i+1] 1.6Å k=10000). 默认关.
+    use_o3p_angle: P2.5 键角约束 (C3'-O3'-P / O3'-P-O5'). 默认关.
+        (两关 = P1 干净版, 纯 4 点 Kabsch 无额外约束, 用于 P3 对比基线)
     """
     try:
         return _amber_refine_impl(
@@ -342,6 +350,8 @@ def amber_refine(
             coding_mask=coding_mask,
             cg_coords=cg_coords,
             coding_restraint_k=coding_restraint_k,
+            use_o3p_bond=use_o3p_bond,
+            use_o3p_angle=use_o3p_angle,
         )
     except Exception as exc:
         print(f"[amber_refine] 精修失败, 返回重建坐标: {exc!r}")
@@ -370,6 +380,8 @@ def _amber_refine_impl(
     coding_mask: Optional[np.ndarray] = None,
     cg_coords: Optional[np.ndarray] = None,
     coding_restraint_k: float = 10000.0,
+    use_o3p_bond: bool = False,
+    use_o3p_angle: bool = False,
 ) -> Tuple[np.ndarray, float, float, Dict[str, int]]:
     """Amber14 OL3 + OBC1 约束最小化全原子结构。
 
@@ -381,8 +393,8 @@ def _amber_refine_impl(
     """
     from openmm import (
         Platform, HarmonicBondForce, CustomBondForce,
-        CustomExternalForce, CustomTorsionForce, VerletIntegrator,
-        LangevinMiddleIntegrator,
+        CustomExternalForce, CustomTorsionForce, CustomAngleForce,
+        VerletIntegrator, LangevinMiddleIntegrator,
     )
     from openmm import unit
     from openmm.app import Simulation
@@ -457,6 +469,53 @@ def _amber_refine_impl(
         bsj_bond.addBond(last_o3, first_p, 0.161, 50000.0)
     system.addForce(bsj_bond)
 
+    # --- 力 2.5: 相邻残基 O3'-P 键长硬约束 (P2, use_o3p_bond 开关) ---
+    # 1EHZ 模板 Kabsch 对齐只保 P/C1'/C4'/O3' 四点, 但相邻残基间 O3'[i]-P[i+1]
+    # 桥接几何会被拉坏 (amber 前 C3'-O3'-P 偏 70°). 加 HarmonicBondForce 把每条
+    # O3'[i]-P[i+1] 键长钉死到 1.6Å (A-form 真值), k=10000 全程紧约束 (不走 k_scale).
+    # 与 OL3 力场自带的 O3'-P 键长项不冲突 (都指向 1.6Å, 只是再钉死防最小化偏离).
+    # 默认关: 关掉 = P1 干净版 (纯 4 点 Kabsch), 用于 P3 对比基线.
+    n_o3p = 0
+    if use_o3p_bond:
+        o3p_bond = HarmonicBondForce()
+        for i in range(L):
+            o3_idx = atom_lookup.get((i + 1, "O3'"))       # 残基 i 的 O3'
+            next_p_idx = atom_lookup.get(((i + 1) % L + 1, "P"))  # 残基 i+1 的 P (环形)
+            if o3_idx is not None and next_p_idx is not None:
+                o3p_bond.addBond(o3_idx, next_p_idx, 0.16, 10000.0)  # r0=1.6Å, k=10000
+                n_o3p += 1
+        system.addForce(o3p_bond)
+
+    # --- 力 2.6: 磷酸桥键角硬约束 (P2.5, use_o3p_angle 开关) ---
+    # P2 键长约束救不了键角 (键长对 ≠ 键角对). 加 CustomAngleForce 直接约束两个
+    # 关键磷酸桥键角: C3'-O3'-P (119.5°), O3'-P-O5' (104.1°), OL3 A-form 真值.
+    # k_angle=500 kJ/mol/rad² 中等强度, 全程紧约束 (不走 k_scale).
+    # 跨残基: C3'[i]-O3'[i]-P[i+1] (顶点 O3'[i]) 和 O3'[i]-P[i+1]-O5'[i+1] (顶点 P[i+1]).
+    # CustomAngleForce.addAngle(p1, p2, p3, params): p2 是顶点.
+    # 默认关: 关掉 = P1 干净版.
+    n_angle = 0
+    if use_o3p_angle:
+        angle_force = CustomAngleForce("0.5*k_angle*(theta-theta0)^2")
+        angle_force.addGlobalParameter("k_angle", 500.0)
+        angle_force.addPerAngleParameter("theta0")
+        THETA_C3_O3_P = 119.5 * np.pi / 180.0  # C3'-O3'-P 平衡角 (rad)
+        THETA_O3_P_O5 = 104.1 * np.pi / 180.0  # O3'-P-O5' 平衡角 (rad)
+        for i in range(L):
+            j = (i + 1) % L  # 下一残基索引
+            c3_i = atom_lookup.get((i + 1, "C3'"))
+            o3_i = atom_lookup.get((i + 1, "O3'"))
+            p_j = atom_lookup.get((j + 1, "P"))
+            o5_j = atom_lookup.get((j + 1, "O5'"))
+            # C3'-O3'-P: 顶点 O3'[i] -> addAngle(C3, O3, P)
+            if None not in (c3_i, o3_i, p_j):
+                angle_force.addAngle(c3_i, o3_i, p_j, [THETA_C3_O3_P])
+                n_angle += 1
+            # O3'-P-O5': 顶点 P[i+1] -> addAngle(O3, P, O5)
+            if None not in (o3_i, p_j, o5_j):
+                angle_force.addAngle(o3_i, p_j, o5_j, [THETA_O3_P_O5])
+                n_angle += 1
+        system.addForce(angle_force)
+
     # --- 力 3: ViennaRNA 配对距离约束 (C1*-C1* ~10.6Å) ---
     pair_force = CustomBondForce("0.5*k_pairdist*(r-r0)^2")
     pair_force.addGlobalParameter("k_pairdist", 100.0)
@@ -473,20 +532,39 @@ def _amber_refine_impl(
     system.addForce(pair_force)
 
     # --- 力 4: A-form 二面角约束 (backbone torsions) ---
+    # alpha = O3'[i-1]-P[i]-O5'[i]-C5'[i] (跨残基, O3' 来自前一残基)
+    # gamma = O5'[i]-C5'[i]-C4'[i]-C3'[i] (残基内)
+    # delta = C5'[i]-C4'[i]-C3'[i]-O3'[i] (残基内)
+    # zeta  = C4'[i]-C3'[i]-O3'[i]-P[i+1]  (跨残基, P 来自下一残基)
+    # 修 bug: 旧版 alpha/zeta 全用本残基原子 (假二面角, 约束了个不存在的角),
+    #   导致真实 alpha/zeta 偏 A-form 100-140°, 碱基堆积距离 7.9Å (真值 3.4Å)。
     torsion = CustomTorsionForce("0.5*k_aform*(theta-theta0)^2")
     torsion.addGlobalParameter("k_aform", 50.0)  # kJ/mol/rad²
     torsion.addPerTorsionParameter("theta0")
     n_torsions = 0
     for res_idx in range(L):
         res_seq = res_idx + 1
+        prev_seq = ((res_idx - 1) % L) + 1  # 前一残基 res_seq (环形)
+        next_seq = ((res_idx + 1) % L) + 1  # 下一残基 res_seq (环形)
         for tname, (angle_deg, a1, a2, a3, a4) in _AFORM_TORSIONS.items():
-            # α/ζ 跨残基: α 的 O3* 是本残基 O3*, P 是下游残基的 P;
-            # ζ 的 P 是下游残基的 P。这里简化: 用本残基内 O3*/P 即可
-            # (近似, 非完美跨残基), 加约束让 backbone 偏 A-form。
-            i1 = atom_lookup.get((res_seq, a1))
-            i2 = atom_lookup.get((res_seq, a2))
-            i3 = atom_lookup.get((res_seq, a3))
-            i4 = atom_lookup.get((res_seq, a4))
+            # alpha: a1 (O3') 取前一残基, 其余本残基
+            if tname == "alpha":
+                i1 = atom_lookup.get((prev_seq, a1))
+                i2 = atom_lookup.get((res_seq, a2))
+                i3 = atom_lookup.get((res_seq, a3))
+                i4 = atom_lookup.get((res_seq, a4))
+            # zeta: a4 (P) 取下一残基, 其余本残基
+            elif tname == "zeta":
+                i1 = atom_lookup.get((res_seq, a1))
+                i2 = atom_lookup.get((res_seq, a2))
+                i3 = atom_lookup.get((res_seq, a3))
+                i4 = atom_lookup.get((next_seq, a4))
+            # gamma/delta: 全本残基
+            else:
+                i1 = atom_lookup.get((res_seq, a1))
+                i2 = atom_lookup.get((res_seq, a2))
+                i3 = atom_lookup.get((res_seq, a3))
+                i4 = atom_lookup.get((res_seq, a4))
             if None in (i1, i2, i3, i4):
                 continue
             theta0 = angle_deg * np.pi / 180.0
@@ -621,6 +699,7 @@ def _amber_refine_impl(
         "max_p_drift": float(max_drift),
         "force_energies": force_energies,
         "n_coding_pinned": n_coding_pinned,
+        "n_o3p_bonds": n_o3p,
     }
     # 返回重原子坐标 (按 structure.atoms 顺序, 不含 H)。上层直接用 serial 索引。
     return refined_heavy, e0, e1, info

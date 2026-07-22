@@ -1,0 +1,37 @@
+# TorusFold Server 配置示例
+#
+# 用法:
+#   torusfold-server --config config.yaml
+#   或复制为 config.yaml 后改值
+#
+# 环境变量覆盖（优先级高于本文件）:
+#   TORUSFOLD_WEIGHTS       权重路径
+#   TORUSFOLD_AF3_URL       AF3 server URL
+#   TORUSFOLD_DEVICE        cpu | cuda
+#   TORUSFOLD_HOST          监听地址
+#   TORUSFOLD_PORT          端口
+#   TORUSFOLD_MIN_SEQ_LEN   最小序列长度
+#   TORUSFOLD_MAX_SEQ_LEN   最大序列长度
+#   TORUSFOLD_BACKEND       强制后端 scheme10 | af3 | polygon（留空=自动）
+
+# Scheme10 权重路径（云端训完拉下来放这）。留空 → 自动走 AF3 兜底。
+# weights_path: models/scheme10_best.pt
+
+weights_path: ""
+
+# AlphaFold3 server（兜底真结构，联网限速）
+af3_server_url: "https://alphafold.ebi.ac.uk/alphafold3-api/predict"
+
+# 推理设备。CPU 安全默认；GPU 需对应 cuda 版 torch。
+device: "cpu"
+
+# uvicorn 监听
+host: "127.0.0.1"
+port: 8000
+
+# 序列长度上下限（含）
+min_seq_len: 10
+max_seq_len: 500
+
+# 强制后端。留空 = 自动（有权重用 scheme10，否则 af3）。
+backend: ""

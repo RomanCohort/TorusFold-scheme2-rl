@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>TorusFold — 100nt circRNA 完整管线结构演示</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.css">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    background: #0e1117; color: #c9d1d9; min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 24px; background: #161b22; border-bottom: 1px solid #30363d;
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 20px; color: #58a6ff; }
+  header .tag { font-size: 13px; color: #8b949e; }
+  header .stat { font-size: 12px; color: #7d8590; }
+  header .stat code { color: #f0883e; }
+  header .verdict { font-size: 12px; font-weight: 600; padding: 2px 10px; border-radius: 10px; }
+  #main { flex: 1; display: flex; min-height: 0; }
+  #viewer-wrap { flex: 1; position: relative; min-width: 0; }
+  #viewer { position: absolute; inset: 0; }
+  aside {
+    width: 360px; flex-shrink: 0; background: #161b22; border-left: 1px solid #30363d;
+    padding: 16px; overflow-y: auto;
+  }
+  aside h2 { font-size: 13px; color: #58a6ff; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+  aside .panel { margin-bottom: 22px; padding-bottom: 16px; border-bottom: 1px solid #21262d; }
+  .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .stat-card { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px; }
+  .stat-card .k { font-size: 11px; color: #7d8590; }
+  .stat-card .v { font-size: 15px; color: #f0883e; font-weight: 600; margin-top: 2px; }
+  .seq-box {
+    background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 8px;
+    font-family: "Consolas", "Courier New", monospace; font-size: 12px; line-height: 1.6;
+    word-break: break-all; color: #7ee787; max-height: 100px; overflow-y: auto;
+  }
+  #status { font-size: 11px; color: #7d8590; padding: 6px 24px; background: #161b22; border-top: 1px solid #30363d; }
+  .pair-row { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 0; color: #c9d1d9; }
+  .pair-row .w { color: #d2a8ff; }
+  .loader { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #8b949e; font-size: 14px; }
+  /* 稳定性面板 */
+  .stab-row { margin-bottom: 14px; }
+  .stab-row .label { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; }
+  .stab-row .label .name { color: #c9d1d9; }
+  .stab-row .label .val { color: #f0883e; font-weight: 600; font-family: "Consolas", monospace; }
+  .bar { height: 8px; background: #0d1117; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; position: relative; }
+  .bar .fill { height: 100%; border-radius: 3px; transition: width .4s; }
+  .bar .target { position: absolute; top: -2px; bottom: -2px; width: 2px; background: #58a6ff; opacity: 0.6; }
+  .stab-row .note { font-size: 10px; color: #7d8590; margin-top: 2px; }
+  .stab-row.good .fill { background: linear-gradient(90deg, #2ea043, #3fb950); }
+  .stab-row.warn .fill { background: linear-gradient(90deg, #d29922, #e3b341); }
+  .stab-row.bad  .fill { background: linear-gradient(90deg, #da3633, #f85149); }
+  .gauge { display: flex; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .gauge .ring { width: 70px; height: 70px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 700;
+    border: 4px solid; }
+  .gauge .ring-text .t { font-size: 12px; color: #c9d1d9; }
+  .gauge .ring-text .d { font-size: 11px; color: #7d8590; margin-top: 2px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TorusFold</h1>
+  <span class="tag">100nt circRNA · CG + openmm 精修 · scheme2</span>
+  <span class="stat">length: <code id="m-len">—</code></span>
+  <span class="stat">pairs: <code id="m-pairs">—</code></span>
+  <span class="stat">BSJ: <code id="m-bsj">—</code></span>
+  <span class="verdict" id="verdict">—</span>
+</header>
+
+<div id="main">
+  <div id="viewer-wrap">
+    <div id="viewer"></div>
+    <div class="loader" id="loader">载入 Mol*…</div>
+  </div>
+  <aside>
+    <div class="panel">
+      <h2>结构稳定性</h2>
+      <div class="gauge">
+        <div class="ring" id="gauge-ring">—</div>
+        <div class="ring-text">
+          <div class="t" id="gauge-label">综合稳定度</div>
+          <div class="d" id="gauge-desc">—</div>
+        </div>
+      </div>
+      <div id="stab-list"></div>
+    </div>
+    <div class="panel">
+      <h2>几何统计</h2>
+      <div class="stat-grid">
+        <div class="stat-card"><div class="k">序列长度</div><div class="v" id="s-len">—</div></div>
+        <div class="stat-card"><div class="k">配对数</div><div class="v" id="s-pairs">—</div></div>
+        <div class="stat-card"><div class="k">BSJ 距离</div><div class="v" id="s-bsj">—</div></div>
+        <div class="stat-card"><div class="k">闭合误差</div><div class="v" id="s-clo">—</div></div>
+        <div class="stat-card"><div class="k">骨架 P-P</div><div class="v" id="s-bb">—</div></div>
+        <div class="stat-card"><div class="k">CG→精修 RMSD</div><div class="v" id="s-rmsd">—</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>说明</h2>
+      <div style="font-size:12px; color:#8b949e; line-height:1.6;">
+        完整管线: ViennaRNA 二级结构 → scheme2 几何约束求解 → openmm 粗粒度能量最小化。<br>
+        骨架 = 磷原子粗粒度, 红虚线 = BSJ 闭环, B-factor = per-residue 置信度。<br>
+        RMSD 偏大属正常: CG 初始构型冲突剧烈 (高能穿模), 精修大幅重排到低能态, 残基位移较大但能量收敛良好。<br>
+        右侧 Mol* 面板可切表示 (surface/cartoon) 与着色。
+      </div>
+    </div>
+    <div class="panel">
+      <h2>序列</h2>
+      <div class="seq-box" id="seq-box"></div>
+    </div>
+    <div class="panel">
+      <h2>碱基配对</h2>
+      <div id="pair-list"></div>
+    </div>
+  </aside>
+</div>
+
+<div id="status">init…</div>
+
+<!-- Python 注入: 纯 JSON, 无转义问题 -->
+<script type="application/json" id="pdb-data">"REMARK   1 TorusFold 100nt demo \u2014 CG + openmm refined (scheme2 full pipeline)\nREMARK   2 length=100, pairs=41, BSJ=5.90A, closure_err=0.000\nREMARK   3 energy: 786409.5 -> -301.1 kJ/mol, RMSD(cg->ref)=28.32A\nREMARK   4 stability_score=0.993\nREMARK   5 P-only coarse-grained. B-factor = per-residue confidence (0-100).\nATOM      1  P   C   A    1      58.463   9.025   4.644  1.00100.00           P\nATOM      2  P   C   A    2      60.739  11.267  -0.317  1.00100.00           P\nATOM      3  P   C   A    3      55.508  10.594   2.333  1.00100.00           P\nATOM      4  P   C   A    4      51.484  13.759  -0.593  1.00100.00           P\nATOM      5  P   C   A    5      45.659  13.050   0.064  1.00100.00           P\nATOM      6  P   C   A    6      43.395  10.575   4.910  1.00100.00           P\nATOM      7  P   C   A    7      45.399  15.320   2.042  1.00100.00           P\nATOM      8  P   C   A    8      45.050  11.482  -2.420  1.00100.00           P\nATOM      9  P   C   A    9      40.083  10.399   0.570  1.00100.00           P\nATOM     10  P   C   A   10      34.765  12.672   1.729  1.00100.00           P\nATOM     11  P   C   A   11      30.812  16.946   0.792  1.00100.00           P\nATOM     12  P   C   A   12      25.335  19.131   0.926  1.00100.00           P\nATOM     13  P   C   A   13      19.969  21.576   1.057  1.00100.00           P\nATOM     14  P   C   A   14      14.764  24.357   1.130  1.00100.00           P\nATOM     15  P   C   A   15      10.663  28.604   1.149  1.00100.00           P\nATOM     16  P   C   A   16       6.828  33.100   1.151  1.00100.00           P\nATOM     17  P   C   A   17       2.809  37.427   1.146  1.00100.00           P\nATOM     18  P   C   A   18      -1.252  41.719   1.114  1.00100.00           P\nATOM     19  P   C   A   19      -5.482  45.840   1.018  1.00100.00           P\nATOM     20  P   C   A   20      -9.865  49.797   0.878  1.00100.00           P\nATOM     21  P   C   A   21     -13.294  54.612   0.827  1.00100.00           P\nATOM     22  P   C   A   22     -17.735  58.503   0.856  1.00100.00           P\nATOM     23  P   C   A   23     -18.576  64.214  -0.359  1.00100.00           P\nATOM     24  P   C   A   24     -21.038  69.574  -0.185  1.00100.00           P\nATOM     25  P   C   A   25     -23.965  74.669  -0.683  1.00100.00           P\nATOM     26  P   C   A   26     -21.947  79.994   0.860  1.00100.00           P\nATOM     27  P   C   A   27     -24.006  85.523   0.921  1.00100.00           P\nATOM     28  P   C   A   28     -19.463  88.533  -1.340  1.00100.00           P\nATOM     29  P   C   A   29     -24.016  91.725   0.631  1.00100.00           P\nATOM     30  P   C   A   30     -25.492  90.846   6.275  1.00100.00           P\nATOM     31  P   C   A   31     -27.118  91.486   0.639  1.00100.00           P\nATOM     32  P   C   A   32     -25.469  97.145   0.395  1.00100.00           P\nATOM     33  P   C   A   33     -30.020  94.065   2.541  1.00100.00           P\nATOM     34  P   C   A   34     -27.841  88.587   2.335  1.00100.00           P\nATOM     35  P   C   A   35     -29.851  83.343   0.526  1.00100.00           P\nATOM     36  P   C   A   36     -27.638  77.880   0.241  1.00100.00           P\nATOM     37  P   C   A   37     -32.856  75.204   0.891  1.00100.00           P\nATOM     38  P   C   A   38     -29.284  70.511   0.864  1.00100.00           P\nATOM     39  P   C   A   39     -24.729  66.765   0.758  1.00100.00           P\nATOM     40  P   C   A   40     -23.800  60.947   0.998  1.00100.00           P\nATOM     41  P   C   A   41     -25.347  55.257   1.000  1.00100.00           P\nATOM     42  P   C   A   42     -19.764  53.348   0.851  1.00100.00           P\nATOM     43  P   C   A   43     -15.727  49.039   0.860  1.00100.00           P\nATOM     44  P   C   A   44     -12.193  44.309   0.778  1.00100.00           P\nATOM     45  P   C   A   45      -9.469  39.078   0.878  1.00100.00           P\nATOM     46  P   C   A   46      -4.934  35.303   0.938  1.00100.00           P\nATOM     47  P   C   A   47      -0.683  31.208   0.992  1.00100.00           P\nATOM     48  P   C   A   48       3.347  26.905   1.147  1.00100.00           P\nATOM     49  P   C   A   49       7.315  22.538   1.143  1.00100.00           P\nATOM     50  P   C   A   50      11.068  17.996   1.326  1.00100.00           P\nATOM     51  P   C   A   51      15.004  13.603   1.229  1.00100.00           P\nATOM     52  P   C   A   52      14.064   7.780   1.241  1.00100.00           P\nATOM     53  P   C   A   53      11.988   2.261   1.392  1.00100.00           P\nATOM     54  P   C   A   54      10.186  -3.353   1.505  1.00100.00           P\nATOM     55  P   C   A   55       7.669  -8.688   1.622  1.00100.00           P\nATOM     56  P   C   A   56       4.363 -13.578   1.744  1.00100.00           P\nATOM     57  P   C   A   57       1.490 -18.735   1.865  1.00100.00           P\nATOM     58  P   C   A   58      -0.620 -24.253   1.937  1.00100.00           P\nATOM     59  P   C   A   59      -2.724 -29.770   1.963  1.00100.00           P\nATOM     60  P   C   A   60      -6.248 -34.511   1.920  1.00100.00           P\nATOM     61  P   C   A   61      -7.618 -40.252   1.889  1.00100.00           P\nATOM     62  P   C   A   62      -9.984 -45.663   1.842  1.00100.00           P\nATOM     63  P   C   A   63     -13.673 -50.265   1.670  1.00100.00           P\nATOM     64  P   C   A   64     -15.317 -55.934   1.835  1.00100.00           P\nATOM     65  P   C   A   65     -18.745 -60.733   1.640  1.00100.00           P\nATOM     66  P   C   A   66     -21.088 -66.150   1.765  1.00100.00           P\nATOM     67  P   C   A   67     -21.418 -72.039   1.919  1.00100.00           P\nATOM     68  P   C   A   68     -26.955 -74.076   1.903  1.00100.00           P\nATOM     69  P   C   A   69     -28.068 -79.866   2.098  1.00100.00           P\nATOM     70  P   C   A   70     -23.044 -82.951   1.911  1.00100.00           P\nATOM     71  P   C   A   71     -18.995 -78.745   1.059  1.00100.00           P\nATOM     72  P   C   A   72     -17.633 -84.435   1.816  1.00100.00           P\nATOM     73  P   C   A   73     -15.907 -90.062   1.369  1.00100.00           P\nATOM     74  P   C   A   74     -10.616 -87.511   1.921  1.00100.00           P\nATOM     75  P   C   A   75     -16.035 -88.411   4.070  1.00100.00           P\nATOM     76  P   C   A   76     -12.660 -84.003   2.073  1.00100.00           P\nATOM     77  P   C   A   77      -8.232 -80.120   1.718  1.00100.00           P\nATOM     78  P   C   A   78     -10.062 -74.541   2.326  1.00100.00           P\nATOM     79  P   C   A   79     -10.834 -68.686   2.392  1.00100.00           P\nATOM     80  P   C   A   80      -8.470 -63.277   2.524  1.00100.00           P\nATOM     81  P   C   A   81      -8.999 -57.399   2.388  1.00100.00           P\nATOM     82  P   C   A   82      -3.919 -54.406   2.649  1.00100.00           P\nATOM     83  P   C   A   83      -0.264 -49.783   2.320  1.00100.00           P\nATOM     84  P   C   A   84       2.125 -44.392   2.074  1.00100.00           P\nATOM     85  P   C   A   85       3.402 -38.634   2.225  1.00100.00           P\nATOM     86  P   C   A   86       6.997 -33.963   1.988  1.00100.00           P\nATOM     87  P   C   A   87       9.065 -28.438   2.019  1.00100.00           P\nATOM     88  P   C   A   88      11.164 -22.927   1.975  1.00100.00           P\nATOM     89  P   C   A   89      14.046 -17.790   1.702  1.00100.00           P\nATOM     90  P   C   A   90      17.395 -12.947   1.383  1.00100.00           P\nATOM     91  P   C   A   91      19.883  -7.612   1.078  1.00100.00           P\nATOM     92  P   C   A   92      21.687  -2.011   0.708  1.00100.00           P\nATOM     93  P   C   A   93      23.790   3.496   0.560  1.00100.00           P\nATOM     94  P   C   A   94      28.823   6.562   0.280  1.00100.00           P\nATOM     95  P   C   A   95      33.789   9.732   0.576  1.00100.00           P\nATOM     96  P   C   A   96      35.239  15.450   0.656  1.00100.00           P\nATOM     97  P   C   A   97      41.048  14.435   0.588  1.00100.00           P\nATOM     98  P   C   A   98      44.955  10.034   1.006  1.00100.00           P\nATOM     99  P   C   A   99      50.477  11.718   2.209  1.00100.00           P\nATOM    100  P   C   A  100      55.156   9.089  -0.241  1.00100.00           P\nCONECT    1  100\nCONECT    1  100\nCONECT    2   99\nCONECT    3   98\nCONECT    4   97\nCONECT    5   96\nCONECT    6   95\nCONECT    8  100\nCONECT    9   99\nCONECT   10   98\nCONECT   11   97\nCONECT   12   96\nCONECT   14   51\nCONECT   15   50\nCONECT   16   49\nCONECT   17   48\nCONECT   18   47\nCONECT   19   46\nCONECT   20   45\nCONECT   21   44\nCONECT   22   39\nCONECT   24   36\nCONECT   25   35\nCONECT   26   34\nCONECT   27   33\nCONECT   28   32\nCONECT   52   93\nCONECT   53   92\nCONECT   54   91\nCONECT   55   90\nCONECT   56   89\nCONECT   57   88\nCONECT   58   87\nCONECT   59   86\nCONECT   60   85\nCONECT   61   84\nCONECT   62   83\nCONECT   63   82\nCONECT   65   80\nCONECT   66   79\nCONECT   70   76\nCONECT   71   75\nEND\n"</script>
+<script type="application/json" id="meta-data">{"length": 100, "sequence": "AUGCGUAACGCGAUGCUAGCAGUACGAUCGUAUCGUAACGCGAUGCUAGCAGUACGAUCGUAUCGUAACGCGAUGCUAGCAGUACGAUCGUACGACGCGU", "bsj": 5.9, "closure_error": 0.0, "backbone_mean": 5.901, "rmsd": 28.324, "energy_before": 786409.46, "energy_after": -301.1, "pairs": [{"i": 0, "j": 99, "w": 0.33632542274344696}, {"i": 1, "j": 98, "w": 0.4275127285883065}, {"i": 2, "j": 97, "w": 0.5196848019526507}, {"i": 3, "j": 96, "w": 0.5198667195090567}, {"i": 4, "j": 95, "w": 0.5186225805843435}, {"i": 5, "j": 94, "w": 0.49185420514060346}, {"i": 7, "j": 99, "w": 0.3418989454326991}, {"i": 8, "j": 98, "w": 0.42198713946286426}, {"i": 9, "j": 97, "w": 0.42513949956925845}, {"i": 10, "j": 96, "w": 0.4251163647746743}, {"i": 11, "j": 95, "w": 0.40919652820076563}, {"i": 13, "j": 50, "w": 0.5604784312619373}, {"i": 14, "j": 49, "w": 0.6979957803149633}, {"i": 15, "j": 48, "w": 0.6983142566246923}, {"i": 16, "j": 47, "w": 0.6979201336698523}, {"i": 17, "j": 46, "w": 0.6979131791972241}, {"i": 18, "j": 45, "w": 0.6981336910409921}, {"i": 19, "j": 44, "w": 0.6977490388157248}, {"i": 20, "j": 43, "w": 0.6421568562350051}, {"i": 21, "j": 38, "w": 0.4033718154265535}, {"i": 23, "j": 35, "w": 0.6072405949819637}, {"i": 24, "j": 34, "w": 0.6128691016278018}, {"i": 25, "j": 33, "w": 0.6128169492702622}, {"i": 26, "j": 32, "w": 0.5970869284460433}, {"i": 27, "j": 31, "w": 0.46924353032661187}, {"i": 51, "j": 92, "w": 0.6906583570464201}, {"i": 52, "j": 91, "w": 0.6933724844361101}, {"i": 53, "j": 90, "w": 0.6939617218617102}, {"i": 54, "j": 89, "w": 0.6943172966508737}, {"i": 55, "j": 88, "w": 0.6943380069524189}, {"i": 56, "j": 87, "w": 0.6940170211546628}, {"i": 57, "j": 86, "w": 0.6939663996132426}, {"i": 58, "j": 85, "w": 0.6942350514225776}, {"i": 59, "j": 84, "w": 0.6815322599434601}, {"i": 60, "j": 83, "w": 0.6760350385995122}, {"i": 61, "j": 82, "w": 0.656405349751283}, {"i": 62, "j": 81, "w": 0.6056617085802891}, {"i": 64, "j": 79, "w": 0.5721564881630721}, {"i": 65, "j": 78, "w": 0.5450169066549947}, {"i": 69, "j": 75, "w": 0.4862925746529779}, {"i": 70, "j": 74, "w": 0.48045197852587174}], "confidence_mean": 1.0}</script>
+<script type="application/json" id="stab-data">{"overall_score": 0.993, "metrics": [{"name": "BSJ 闭合度", "score": 0.9999859079175941, "display": "5.90 Å / 目标 5.9", "note": "BSJ 误差 0.000 Å, 越接近 5.9 越好", "target_pos": 1.0}, {"name": "骨架键长达标", "score": 1.0, "display": "100% / RMSD 0.00 Å", "note": "相邻 P-P 接近 5.9±0.3 的比例"}, {"name": "碱基配对达标", "score": 0.975609756097561, "display": "98% / RMSD 0.41 Å", "note": "WC 配对 P-P 接近 10.6±1.5 的比例 (40/41)"}, {"name": "原子碰撞率", "score": 0.9983505154639175, "display": "0.0% 碰撞", "note": "非相邻 P-P < 3.0 Å 的比例 (越低越稳定)", "target_pos": 0.0}, {"name": "能量收敛", "score": 1.0, "display": "↓ 100.0%", "note": "openmm 最小化: 786409.5 → -301.1 kJ/mol"}]}</script>
+
+<script src="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.js"></script>
+<script>
+const PDB = JSON.parse(document.getElementById('pdb-data').textContent);
+const META = JSON.parse(document.getElementById('meta-data').textContent);
+const STAB = JSON.parse(document.getElementById('stab-data').textContent);
+const setStatus = (s) => { document.getElementById('status').textContent = s; };
+
+// ---------- 填侧栏 ----------
+document.getElementById('m-len').textContent = META.length;
+document.getElementById('m-pairs').textContent = META.pairs.length;
+document.getElementById('m-bsj').textContent = META.bsj.toFixed(2) + ' A';
+document.getElementById('s-len').textContent = META.length + ' nt';
+document.getElementById('s-pairs').textContent = META.pairs.length;
+document.getElementById('s-bsj').textContent = META.bsj.toFixed(2) + ' A';
+document.getElementById('s-clo').textContent = META.closure_error.toFixed(3);
+document.getElementById('s-bb').textContent = META.backbone_mean.toFixed(2) + ' A';
+document.getElementById('s-rmsd').textContent = META.rmsd.toFixed(2) + ' A';
+document.getElementById('seq-box').textContent = META.sequence;
+
+const pairList = document.getElementById('pair-list');
+META.pairs.forEach(p => {
+  const row = document.createElement('div');
+  row.className = 'pair-row';
+  const ring = Math.min(Math.abs(p.i - p.j), META.length - Math.abs(p.i - p.j));
+  row.innerHTML = '<span>' + (p.i + 1) + ' <-> ' + (p.j + 1)
+    + ' <span style="color:#7d8590">(环距 ' + ring + ')</span></span>'
+    + '<span class="w">w=' + p.w.toFixed(2) + '</span>';
+  pairList.appendChild(row);
+});
+
+// ---------- 稳定性可视化 ----------
+function stabClass(score) {
+  if (score >= 0.75) return 'good';
+  if (score >= 0.45) return 'warn';
+  return 'bad';
+}
+function stabColor(score) {
+  const c = stabClass(score);
+  if (c === 'good') return '#3fb950';
+  if (c === 'warn') return '#e3b341';
+  return '#f85149';
+}
+function verdictText(score) {
+  if (score >= 0.75) return '稳定';
+  if (score >= 0.45) return '基本稳定';
+  return '不稳定';
+}
+
+// 综合评分
+const overall = STAB.overall_score;
+const vc = stabColor(overall);
+const verdictEl = document.getElementById('verdict');
+verdictEl.textContent = verdictText(overall) + ' (' + (overall * 100).toFixed(0) + ')';
+verdictEl.style.color = vc;
+verdictEl.style.background = vc + '22';
+verdictEl.style.border = '1px solid ' + vc + '55';
+
+// 仪表盘
+const ring = document.getElementById('gauge-ring');
+ring.textContent = (overall * 100).toFixed(0);
+ring.style.color = vc;
+ring.style.borderColor = vc;
+document.getElementById('gauge-label').textContent = '综合结构稳定度';
+document.getElementById('gauge-desc').textContent = '加权: 闭合/配对/碰撞/键长/能量';
+
+// 各指标条
+const stabList = document.getElementById('stab-list');
+STAB.metrics.forEach(m => {
+  const cls = stabClass(m.score);
+  const row = document.createElement('div');
+  row.className = 'stab-row ' + cls;
+  const fillW = (m.score * 100).toFixed(0);
+  // 目标线位置 (m.target 归一化 0-1, 无则不画)
+  let targetHtml = '';
+  if (m.target_pos != null) {
+    targetHtml = '<div class="target" style="left:' + (m.target_pos * 100).toFixed(0) + '%"></div>';
+  }
+  row.innerHTML =
+    '<div class="label"><span class="name">' + m.name + '</span>'
+    + '<span class="val">' + m.display + '</span></div>'
+    + '<div class="bar"><div class="fill" style="width:' + fillW + '%"></div>' + targetHtml + '</div>'
+    + '<div class="note">' + m.note + '</div>';
+  stabList.appendChild(row);
+});
+
+// ---------- Mol* 5.10.1 (API 照搬已验证的 circrna_viewer.js) ----------
+async function build() {
+  setStatus('init Mol* viewer...');
+  const viewer = await molstar.Viewer.create('viewer', {
+    layoutIsExpanded: false,
+    viewportShowExpand: true,
+    viewportShowControls: false,
+    viewportShowAnimation: false,
+    viewportShowSettings: false,
+    backgroundColor: { r: 0.055, g: 0.067, b: 0.091 },
+  });
+  setStatus('loading refined PDB...');
+  await viewer.loadStructureFromData(PDB, 'pdb', { dataLabel: 'circRNA-100nt-refined' });
+  document.getElementById('loader').style.display = 'none';
+  setStatus('ready | 100nt circRNA (精修后) loaded');
+}
+build().catch(e => {
+  setStatus('ERROR: ' + e);
+  console.error(e);
+});
+</script>
+</body>
+</html>

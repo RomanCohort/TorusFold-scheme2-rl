@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torusfold"
+version = "0.1.0"
+description = "circRNA 3D structure prediction: 10 schemes, unified TrunkOutput, SO(2)×SO(2) equivariant immune fingerprint heads."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "TorusFold contributors" }]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.23",
+    "pyyaml>=6.0",
+    "requests>=2.28",
+    "tqdm>=4.64",
+]
+
+[project.optional-dependencies]
+md = ["openmm>=8.0"]        # stage4 MD relaxation
+parallel = ["ray>=2.7"]     # pipeline parallelism
+rna = ["viennarna>=2.6"]    # stage1 ViennaRNA folding (optional, has C fallback)
+server = [
+    "fastapi>=0.100",
+    "uvicorn[standard]>=0.23",
+    "pydantic>=2.0",
+]
+all = ["torusfold[md,parallel,rna,server]"]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+torusfold-server = "torusfold.server.cli:server_main"
+torusfold-predict = "torusfold.server.cli:predict_main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+torusfold = ["py.typed", "web/*.html", "web/*.js", "web/*.css"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"

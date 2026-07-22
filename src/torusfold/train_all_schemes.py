@@ -1,0 +1,2299 @@
+#!/usr/bin/env python3
+"""
+train_all_schemes.py — Train all 8 TorusFold schemes (0-7) on 3D pseudo-labels.
+
+Scheme 0: CircFold Baseline (线性RNA环化法)
+  - Data generation pipeline: ViennaRNA → trRosettaRNA2 → OpenMM → MD → Filter
+  - Role: Teacher model for Scheme 3
+  - Output: ~80,000 high-quality circRNA 3D structures
+
+Scheme 1-7: Trainable models with different architectures:
+  - Scheme 1: DL+Physics Cascade (EGNN → Physics refinement)
+  - Scheme 2: Batch+Physics Filter (Batch sampling → Energy filter)
+  - Scheme 3: Dual-Engine Distillation (Teacher: Scheme 0, Student: Scheme 1/6/7)
+  - Scheme 4: DDPM+EGNN Guided (Diffusion with closure reward)
+  - Scheme 5: Physics-Biased Attention [DEPRECATED — NaN explosion, CPU bottleneck]
+  - Scheme 6: GNN Latent Diffusion (Encoder → Latent diffusion → Decoder)
+  - Scheme 7: Mamba+Transformer Hybrid Diffusion (O(L) global + O(L×w) local)
+
+Training Flow:
+    Step 1: Scheme 0 (Pipeline) generates data → 80k structures
+    Step 2: Scheme 1/2/4/6/7 train on data
+    Step 3: Scheme 3 uses Scheme 0 as Teacher → distill to Student
+
+Usage:
+    # Generate data first (Scheme 0)
+    python circfold_baseline.py --fasta circbase.fa --output scheme0_output
+
+    # Train regular schemes (1/2/4/6/7)
+    python train_all_schemes.py --schemes 1 2 4 6 7 --labels-dir scheme0_output
+
+    # Train Scheme 3 (distillation from Scheme 0)
+    python scheme3_dual_engine.py --fasta circbase.fa --student-scheme 7
+"""
+
+import os
+import sys
+import math
+import argparse
+import json
+import dataclasses
+import time
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from torusfold.constraint_solver import (
+    GeometricConstraintSolver, SolverConfig
+)
+
+
+def kabsch_rmsd(pred: torch.Tensor, target: torch.Tensor) -> float:
+    """Compute RMSD after Kabsch optimal alignment.
+
+    Args:
+        pred: (L, 3) predicted coordinates
+        target: (L, 3) target coordinates
+
+    Returns:
+        RMSD in Angstroms after optimal superposition
+    """
+    # Detach to avoid autograd issues and ensure clean computation
+    p_c = (pred - pred.mean(dim=0)).detach().double()
+    t_c = (target - target.mean(dim=0)).detach().double()
+
+    # Kabsch SVD alignment: align p_c onto t_c
+    # H = P^T @ Q, then R = V @ D @ U^T (with D = diag(1, 1, det(V @ U^T)))
+    H = p_c.T @ t_c  # (3, 3)
+    try:
+        U, S, Vt = torch.linalg.svd(H)
+        d = torch.det(Vt.T @ U.T).sign()  # det(V @ U^T)
+        # Handle degenerate case: if det is 0, d=1 (no reflection correction needed)
+        if d.item() == 0:
+            d = torch.tensor(1.0, device=pred.device, dtype=torch.float64)
+        D = torch.diag(torch.tensor([1.0, 1.0, d.item()], device=pred.device, dtype=torch.float64))
+        R = Vt.T @ D @ U.T  # V @ D @ U^T
+        p_aligned = (R @ p_c.T).T
+        rmsd = torch.sqrt(torch.mean(torch.sum((p_aligned - t_c) ** 2, dim=1)))
+    except Exception:
+        # Fallback: simple centered RMSD (no alignment)
+        rmsd = torch.sqrt(torch.mean(torch.sum((p_c - t_c) ** 2, dim=1)))
+
+    result = rmsd.float().item()
+    if math.isnan(result) or math.isinf(result):
+        return float('inf')
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Common: 3D Pseudo-label Loading
+# ═══════════════════════════════════════════════════════════════
+
+def load_pseudo_labels(labels_dir, n_seqs=None, max_len=None):
+    """Load 3D pseudo-labels from disk.
+
+    Args:
+        labels_dir: Directory containing sequences.json and coords/
+        n_seqs: Maximum number of sequences to load
+        max_len: Maximum sequence length (filter out longer sequences)
+
+    Expected structure:
+        labels_dir/
+            sequences.json  # {id, sequence, secondary_structure, pair_constraints}
+            coords/
+                pseudo_0000.npy
+                pseudo_0001.npy
+                ...
+            metadata.json  # summary + per-sample info
+    """
+    import glob
+
+    # Load sequences
+    seq_path = os.path.join(labels_dir, 'sequences.json')
+    if not os.path.exists(seq_path):
+        raise FileNotFoundError(f"sequences.json not found in {labels_dir}")
+
+    with open(seq_path, 'r') as f:
+        seq_data = json.load(f)
+
+    if n_seqs is not None:
+        seq_data = seq_data[:n_seqs]
+
+    # Load coordinates by matching json id (not glob sort, which may mismatch)
+    sequences = []
+    coords_labels = []
+    pair_labels = []  # For schemes needing pair probs
+    confidence_weights = []  # Per-sample confidence from source quality
+    metadata = []
+    n_missing = 0
+
+    # Default confidence by source
+    # IMPORTANT: Augmented samples (pdb_circularized_aug, isrnacirc_aug) are noisy copies
+    # of original structures. They should have LOWER confidence to prevent overfitting
+    # to noise and ensure the model learns from real structures primarily.
+    # Updated weights according to training_strategy_v2.md
+    # Key changes: pdb_circularized/pdb3d should be validation only (weight 0.0)
+    DEFAULT_CONFIDENCE = {
+        "pdb_circularized": 0.0,       # Validation set ONLY (not for training)
+        "pdb3d": 0.0,                  # Validation set ONLY (not for training)
+        "pdb_circularized_aug": 0.5,   # NOISY COPY - reduced from 0.95 to prevent overfitting
+        "shape_experimental": 1.5,     # Experimental validation, highest quality
+        "shape_expanded": 1.2,         # Expanded data, high quality
+        "isrnacirc": 0.7,
+        "isrnacirc_aug": 0.35,         # NOISY COPY - reduced from 0.65
+        "trrosetta_predicted": 1.0,    # Computed prediction, standard quality
+        "rfam_consensus": 1.0,         # Rfam consensus, medium quality
+        "circbase_real": 0.5,
+        "medium_synth": 0.4,
+        "synthetic": 0.5,              # Synthetic data, low weight
+        "vienna_fallback": 0.3,        # ViennaRNA fallback, lowest weight
+        "af3_predicted": 1.0,
+    }
+
+    for i, item in enumerate(seq_data):
+        seq_id = item.get('id', f'pseudo_{i:05d}')
+        coords_path = os.path.join(labels_dir, 'coords', f'{seq_id}.npy')
+
+        if not os.path.exists(coords_path):
+            n_missing += 1
+            continue
+
+        seq = item['sequence']
+        coords = np.load(coords_path)  # (L, 3)
+
+        # Verify coords shape matches sequence length
+        if coords.shape[0] != len(seq):
+            n_missing += 1
+            continue
+
+        # Filter out corrupt coords (NaN/Inf/zero)
+        if np.isnan(coords).any() or np.isinf(coords).any():
+            n_missing += 1
+            continue
+        if np.abs(coords).max() == 0:
+            n_missing += 1
+            continue
+
+        sequences.append(seq)
+        coords_labels.append(coords)
+
+        # Parse pairs from constraints (optional field)
+        pair_list = item.get('pair_constraints', [])
+
+        # Build pair probability matrix
+        L = len(seq)
+        pair_prob = np.zeros((L, L))
+        complement = {'A': 'U', 'U': 'A', 'G': 'C', 'C': 'G'}
+
+        # From explicit constraints (high probability)
+        for p1, p2 in pair_list:
+            if p1 < p2:
+                pair_prob[p1, p2] = 0.85
+                pair_prob[p2, p1] = 0.85
+
+        # BSJ flanking: boost pair probability near back-splice junction
+        # In circRNA, nucleotides flanking the BSJ are more likely to pair
+        bsj_window = min(8, L // 4)
+        for j in range(bsj_window):
+            for k in range(max(0, L - bsj_window), L):
+                if pair_prob[j, k] == 0:
+                    b1, b2 = seq[j], seq[k]
+                    if complement.get(b1) == b2 or (b1 in 'GU' and b2 in 'GU'):
+                        pair_prob[j, k] = 0.25
+                        pair_prob[k, j] = 0.25
+                elif pair_prob[j, k] < 0.85:
+                    # Boost existing pairs near BSJ
+                    pair_prob[j, k] = min(0.95, pair_prob[j, k] * 1.2)
+                    pair_prob[k, j] = pair_prob[j, k]
+
+        # Fill loops with heuristic pairing
+        for j in range(L):
+            for k in range(j + 4, min(j + 20, L)):
+                if pair_prob[j, k] == 0:
+                    b1, b2 = seq[j], seq[k]
+                    if (b1 == 'G' and b2 == 'U') or (b1 == 'U' and b2 == 'G'):
+                        pair_prob[j, k] = 0.3
+                        pair_prob[k, j] = 0.3
+                    elif complement.get(b1) == b2:
+                        pair_prob[j, k] = 0.15
+                        pair_prob[k, j] = 0.15
+
+        pair_labels.append(pair_prob)
+
+        # Confidence weight from source quality
+        source = item.get('source', 'synthetic')
+        conf = item.get('confidence', DEFAULT_CONFIDENCE.get(source, 0.3))
+        confidence_weights.append(conf)
+
+        # Add to metadata
+        metadata.append({
+            'id': item['id'],
+            'length': L,
+            'source': source,
+            'confidence': conf,
+        })
+
+    if n_missing > 0:
+        print(f"  Skipped {n_missing} entries with missing/mismatched coords")
+
+    # Filter out samples with NaN/Inf in coords (corrupt data)
+    valid_mask = []
+    n_invalid = 0
+    for i, coords in enumerate(coords_labels):
+        if np.isnan(coords).any() or np.isinf(coords).any():
+            n_invalid += 1
+            valid_mask.append(False)
+        else:
+            valid_mask.append(True)
+    if n_invalid > 0:
+        print(f"  Filtered {n_invalid} samples with NaN/Inf coords")
+        sequences = [s for s, v in zip(sequences, valid_mask) if v]
+        coords_labels = [c for c, v in zip(coords_labels, valid_mask) if v]
+        pair_labels = [p for p, v in zip(pair_labels, valid_mask) if v]
+        confidence_weights = [cw for cw, v in zip(confidence_weights, valid_mask) if v]
+        metadata = [m for m, v in zip(metadata, valid_mask) if v]
+
+    # Filter by max_len if specified
+    if max_len is not None:
+        keep = [i for i, m in enumerate(metadata) if m['length'] <= max_len]
+        sequences = [sequences[i] for i in keep]
+        coords_labels = [coords_labels[i] for i in keep]
+        pair_labels = [pair_labels[i] for i in keep]
+        confidence_weights = [confidence_weights[i] for i in keep]
+        metadata = [metadata[i] for i in keep]
+        print(f"  After max_len={max_len} filter: {len(sequences)} samples")
+
+    avg_conf = np.mean(confidence_weights)
+    print(f"  Loaded {len(sequences)} pseudo-labels from {labels_dir}")
+    print(f"  Average confidence: {avg_conf:.3f}")
+
+    return sequences, coords_labels, pair_labels, confidence_weights, metadata
+
+
+def generate_3d_pseudo_labels(n_seqs=500, min_len=30, max_len=500, seed=42):
+    """Generate 3D coordinate pseudo-labels using ViennaRNA + Physics Solver."""
+    rng = np.random.RandomState(seed)
+    bases = ['A', 'C', 'G', 'U']
+
+    sequences = []
+    coords_labels = []
+    pair_labels = []
+    metadata = []
+
+    print(f"  Generating {n_seqs} pseudo-labels...")
+
+    try:
+        import RNA
+        has_vienna = True
+        print("  ViennaRNA: available (circ mode)")
+    except ImportError:
+        has_vienna = False
+        print("  ViennaRNA: NOT available")
+
+    config = SolverConfig(n_samples=10, use_annealing_closure=True)
+    solver = GeometricConstraintSolver(config)
+
+    for i in range(n_seqs):
+        L = rng.randint(min_len, max_len)
+        seq = ''.join(rng.choice(bases, size=L))
+
+        pair_constraints = []
+
+        if has_vienna:
+            try:
+                md = RNA.md()
+                md.circ = True
+                fc = RNA.fold_compound(seq, md)
+                structure, mfe = fc.mfe()
+                stack = []
+                for pos, char in enumerate(structure):
+                    if char == '(':
+                        stack.append(pos)
+                    elif char == ')' and stack:
+                        pair_constraints.append((stack.pop(), pos, 10.6, 1.0))
+            except Exception:
+                pass
+
+        if not pair_constraints:
+            complement = {'A': 'U', 'U': 'A', 'G': 'C', 'C': 'G'}
+            for j in range(L):
+                for k in range(j + 4, min(j + 20, L)):
+                    if complement.get(seq[j]) == seq[k] and rng.random() < 0.3:
+                        pair_constraints.append((j, k, 10.6, 1.0))
+
+        class CS:
+            def __init__(self, n, pairs):
+                self.seq_len = n
+                self.pair_constraints = pairs
+
+        cs = CS(L, pair_constraints)
+        conformations = solver.solve(cs)
+
+        if conformations and len(conformations) > 0:
+            best_coords = conformations[0]
+            closure_err = abs(np.linalg.norm(best_coords[0] - best_coords[-1]) - 5.9)
+
+            if closure_err < 2.0:
+                sequences.append(seq)
+                coords_labels.append(best_coords)
+
+                pair_prob = np.zeros((L, L))
+                for (p1, p2, _, _) in pair_constraints:
+                    pair_prob[p1, p2] = 0.85
+                    pair_prob[p2, p1] = 0.85
+                pair_labels.append(pair_prob)
+
+                metadata.append({'id': f'pseudo_{i:04d}', 'length': L})
+
+                if len(sequences) % 100 == 0:
+                    print(f"    {len(sequences)}/{n_seqs}")
+
+    print(f"  Generated: {len(sequences)}/{n_seqs}")
+    return sequences, coords_labels, pair_labels, metadata
+
+
+class CircRNADataset(Dataset):
+    def __init__(self, sequences, coords_labels, pair_labels=None, confidence_weights=None):
+        self.sequences = sequences
+        self.coords_labels = coords_labels
+        self.pair_labels = pair_labels
+        self.confidence_weights = confidence_weights
+
+    def __len__(self):
+        return len(self.sequences)
+
+    def __getitem__(self, idx):
+        seq = self.sequences[idx]
+        coords = self.coords_labels[idx]
+
+        mapping = {'A': 0, 'U': 1, 'G': 2, 'C': 3}
+        seq_ids = torch.tensor([mapping.get(b, 4) for b in seq], dtype=torch.long)
+        coords_tensor = torch.tensor(coords, dtype=torch.float32)
+        # Replace Inf/NaN with 0 (corrupt data protection)
+        coords_tensor = torch.where(torch.isfinite(coords_tensor), coords_tensor, torch.zeros_like(coords_tensor))
+
+        # Use actual coords length (may differ from seq length due to data issues)
+        actual_L = coords_tensor.shape[0]
+        if len(seq) != actual_L:
+            # Truncate or pad seq to match coords
+            if len(seq) > actual_L:
+                seq_ids = seq_ids[:actual_L]
+            else:
+                seq_ids = torch.cat([seq_ids, torch.zeros(actual_L - len(seq), dtype=torch.long)])
+
+        item = {'seq_ids': seq_ids, 'coords': coords_tensor, 'length': actual_L}
+
+        if self.pair_labels is not None:
+            pair_tensor = torch.tensor(self.pair_labels[idx], dtype=torch.float32)
+            item['pair_probs'] = pair_tensor
+
+        if self.confidence_weights is not None:
+            item['confidence'] = torch.tensor(self.confidence_weights[idx], dtype=torch.float32)
+
+        return item
+
+
+def collate_fn(batch):
+    max_len = max(b['length'] for b in batch)
+    seq_ids_batch, coords_batch, lengths = [], [], []
+    has_pairs = 'pair_probs' in batch[0]
+    has_conf = 'confidence' in batch[0]
+    pair_batch = [] if has_pairs else None
+    conf_batch = [] if has_conf else None
+
+    for b in batch:
+        L = b['length']
+        seq_pad = torch.zeros(max_len, dtype=torch.long)
+        seq_pad[:L] = b['seq_ids']
+        seq_ids_batch.append(seq_pad)
+
+        # Pad with last valid coord instead of zeros
+        # Verify data consistency first
+        coords_actual_shape = b['coords'].shape[0]
+        if coords_actual_shape != L:
+            # Data mismatch: coords shape differs from declared length
+            # Use actual coords length for padding
+            actual_L = coords_actual_shape
+            if actual_L < max_len:
+                coords_pad = b['coords'][-1:].expand(max_len, 3).clone()
+                coords_pad[:actual_L] = b['coords']
+            else:
+                coords_pad = b['coords'][:max_len].clone()
+            # Update length to actual
+            L = actual_L
+        elif L < max_len:
+            coords_pad = b['coords'][-1:].expand(max_len, 3).clone()
+            coords_pad[:L] = b['coords']
+        else:
+            coords_pad = b['coords'].clone()
+        coords_batch.append(coords_pad)
+        lengths.append(L)
+
+        if has_pairs:
+            pp = torch.zeros(max_len, max_len)
+            pp[:L, :L] = b['pair_probs']
+            pair_batch.append(pp)
+
+        if has_conf:
+            conf_batch.append(b['confidence'])
+
+    result = {
+        'seq_ids': torch.stack(seq_ids_batch),
+        'coords': torch.stack(coords_batch),
+        'lengths': lengths,
+    }
+    if has_pairs:
+        result['pair_probs'] = torch.stack(pair_batch)
+    if has_conf:
+        result['confidence'] = torch.stack(conf_batch)
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 1: DL+Physics Cascade
+# ═══════════════════════════════════════════════════════════════
+
+class Scheme1Model(nn.Module):
+    """EGNN backbone → Physics refinement cascade."""
+    def __init__(self, d_hidden=128, n_layers=4):
+        super().__init__()
+        from torusfold.train_torusfold_3d import CircRNA3DModel
+        self.egnn = CircRNA3DModel(d_hidden=d_hidden, n_layers=n_layers)
+
+    def forward(self, seq_ids):
+        return self.egnn(seq_ids)
+
+
+def train_scheme1(train_loader, val_loader, args, device):
+    print("\n" + "="*60)
+    print("  Training Scheme 1: DL+Physics Cascade (with closure penalty)")
+    print("="*60)
+
+    model = Scheme1Model(d_hidden=args.d_hidden, n_layers=args.n_layers).to(device)
+    # Lower lr + warmup for EGNN stability (default 1e-3 caused loss spikes)
+    base_lr = min(args.lr, 1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+    warmup_epochs = 5
+    w_closure = getattr(args, 'w_closure', 5.0)  # closure penalty weight
+    bond_length = 5.9  # Å, P-P backbone distance
+    print(f"  LR={base_lr:.1e} (capped from {args.lr:.1e}), warmup={warmup_epochs} epochs")
+    print(f"  w_closure={w_closure}, target_bond={bond_length}Å")
+
+    best_val = float('inf')
+    patience_counter = 0
+
+    for epoch in range(args.epochs):
+        # Warmup: linearly ramp lr from base_lr*0.01 to base_lr over warmup_epochs
+        if epoch < warmup_epochs:
+            warmup_factor = (epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = base_lr * warmup_factor
+
+        model.train()
+        train_loss = 0
+        train_rmsd_sum = 0.0
+        train_closure_sum = 0.0
+        n_train_batches = 0
+        nan_batches = 0
+        for batch in train_loader:
+            seq_ids = batch['seq_ids'].to(device)
+            target = batch['coords'].to(device)
+            lengths = batch['lengths']
+
+            # Skip batches with Inf/NaN in target coords (corrupt data)
+            if torch.isinf(target).any() or torch.isnan(target).any():
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            # FIX: Proper normalization for 3D coordinates
+            # Both pred and target should be in normalized unit-sphere space
+            # Then denormalize by target_scale for physical loss (closure, bond)
+            B, L, _ = target.shape
+            target_centered = target - target.mean(dim=1, keepdim=True)
+            target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+            target_norm = target_centered / target_scale  # unit-sphere normalized
+
+            out = model(seq_ids)
+            pred = out['coords']
+
+            # Normalize prediction to unit-sphere (like target_norm)
+            pred_centered = pred - pred.mean(dim=1, keepdim=True)
+            pred_scale = torch.norm(pred_centered, dim=(1,2), keepdim=True).clamp(min=1e-6)
+            pred_norm = pred_centered / pred_scale  # unit-sphere normalized
+
+            # MSE on normalized coords (both in unit-sphere space)
+            coord_loss = 0
+            for b in range(B):
+                valid_L = lengths[b]
+                diff = pred_norm[b, :valid_L] - target_norm[b, :valid_L]
+                coord_loss += torch.mean(diff ** 2)
+            coord_loss /= B
+
+            # Denormalize for physical losses: scale pred_norm by target_scale
+            # This puts prediction in the same Å-scale as target
+            pred_denorm = pred_norm * target_scale + target.mean(dim=1, keepdim=True)
+            closure_dists = torch.norm(pred_denorm[:, 0] - pred_denorm[:, -1], dim=-1)  # (B,)
+            # Mask: only count samples where both first and last positions are valid
+            closure_mask = torch.tensor([lengths[b] >= 2 for b in range(B)],
+                                        device=device, dtype=torch.float32)
+            closure_loss = (closure_mask * (closure_dists - bond_length) ** 2).sum() / closure_mask.sum().clamp(min=1.0)
+
+            # Bond consistency loss (vectorized per-batch, only adjacent bonds)
+            bond_loss = torch.tensor(0.0, device=device)
+            n_bond_samples = 0
+            for b in range(B):
+                valid_L = lengths[b]
+                if valid_L < 4:
+                    continue
+                bonds = torch.norm(
+                    pred_denorm[b, 1:valid_L] - pred_denorm[b, :valid_L-1], dim=-1
+                )
+                # BSJ bond (last → first)
+                bsj_bond = torch.norm(pred_denorm[b, 0] - pred_denorm[b, valid_L-1])
+                all_bonds = torch.cat([bonds, bsj_bond.unsqueeze(0)])
+                bond_loss = bond_loss + F.mse_loss(all_bonds, torch.full_like(all_bonds, bond_length))
+                n_bond_samples += 1
+            bond_loss = bond_loss / max(n_bond_samples, 1)
+
+            # Total loss: coord + closure + bond
+            loss = coord_loss + w_closure * closure_loss + 0.5 * bond_loss
+
+            # Apply confidence weighting: higher quality data gets higher loss weight
+            loss = loss * conf_scale * 2.0  # *2 to normalize around 1.0
+
+            loss.backward()
+            # Check for NaN gradients
+            has_nan = False
+            for p in model.parameters():
+                if p.grad is not None and torch.isnan(p.grad).any():
+                    has_nan = True
+                    break
+            if has_nan:
+                optimizer.zero_grad()
+                continue  # Skip this batch
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            n_train_batches += 1
+            if not torch.isnan(loss):
+                train_loss += loss.item()
+                # Track average closure error in Å
+                with torch.no_grad():
+                    valid_closure = closure_dists[closure_mask.bool()]
+                    if len(valid_closure) > 0:
+                        train_closure_sum += valid_closure.mean().item()
+                # Track train RMSD in Å for comparable logging
+                with torch.no_grad():
+                    for b in range(B):
+                        valid_L = lengths[b]
+                        if valid_L < 4:
+                            continue
+                        # FIX: Use pred_norm (already normalized) for denormalization
+                        p_denorm = pred_norm[b, :valid_L] * target_scale[b] + target[b].mean(dim=0, keepdim=True)
+                        t_denorm = target[b, :valid_L]
+                        p_c = p_denorm - p_denorm.mean(dim=0)
+                        t_c = t_denorm - t_denorm.mean(dim=0)
+                        if p_c.abs().sum() > 1e-6 and t_c.abs().sum() > 1e-6:
+                            rmsd = kabsch_rmsd(p_c, t_c)
+                            if not (np.isnan(rmsd) or np.isinf(rmsd)):
+                                train_rmsd_sum += rmsd
+
+        # Validation: RMSD + closure in Angstroms
+        model.eval()
+        val_rmsd = 0
+        val_closure_sum = 0.0
+        n_val_samples = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                target = batch['coords'].to(device)
+                lengths = batch['lengths']
+
+                # Skip invalid targets
+                if torch.isnan(target).any() or torch.isinf(target).any():
+                    continue
+                if target.abs().sum() < 1e-3:
+                    continue
+
+                B, L, _ = target.shape
+
+                # Get target scale for proper denormalization
+                target_centered = target - target.mean(dim=1, keepdim=True)
+                target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+
+                # Model forward (output is raw coordinates, not normalized)
+                out = model(seq_ids)
+                pred = out['coords']
+
+                if torch.isnan(pred).any() or torch.isinf(pred).any():
+                    continue
+
+                # Normalize prediction to unit-sphere scale (same as training), then denormalize to Å
+                pred_centered = pred - pred.mean(dim=1, keepdim=True)
+                pred_scale = torch.norm(pred_centered, dim=(1,2), keepdim=True).clamp(min=1e-6)
+                pred_norm = pred_centered / pred_scale
+                pred_denorm = pred_norm * target_scale + target.mean(dim=1, keepdim=True)
+
+                for b in range(B):
+                    valid_L = lengths[b]
+                    if valid_L < 4:
+                        continue
+                    p = pred_denorm[b, :valid_L]
+                    t = target[b, :valid_L]
+
+                    # Center for Kabsch
+                    p_c = p - p.mean(dim=0)
+                    t_c = t - t.mean(dim=0)
+
+                    # Skip zero-variance
+                    if p_c.abs().sum() < 1e-6 or t_c.abs().sum() < 1e-6:
+                        continue
+
+                    rmsd = kabsch_rmsd(p_c, t_c)
+                    if not (np.isnan(rmsd) or np.isinf(rmsd)):
+                        val_rmsd += rmsd
+                        n_val_samples += 1
+
+                    # Track closure
+                    closure_dist = torch.norm(pred_denorm[b, 0] - pred_denorm[b, valid_L-1]).item()
+                    val_closure_sum += closure_dist
+
+        avg_train = train_loss / max(n_train_batches, 1)
+        avg_train_rmsd = train_rmsd_sum / max(n_train_batches, 1) if n_train_batches > 0 else float('inf')
+        avg_train_closure = train_closure_sum / max(n_train_batches, 1)
+        # Fallback: use train loss scaled to approximate RMSD (train is normalized MSE)
+        # RMSD ≈ sqrt(train_loss) * typical_scale (Å)
+        avg_val = val_rmsd / max(n_val_samples, 1) if n_val_samples > 0 else avg_train * 100
+        avg_val_closure = val_closure_sum / max(n_val_samples, 1) if n_val_samples > 0 else float('inf')
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme1_best.pt")
+        else:
+            patience_counter += 1
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} train_rmsd={avg_train_rmsd:.1f}Å "
+              f"closure={avg_train_closure:.2f}Å "
+              f"val={avg_val:.1f}Å val_closure={avg_val_closure:.2f}Å "
+              f"lr={current_lr:.1e} nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val loss: {best_val:.4f}")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 4: DDPM+EGNN Guided Diffusion
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme4(train_loader, val_loader, args, device):
+    print("\n" + "="*60)
+    print("  Training Scheme 4: DDPM+EGNN Guided Diffusion")
+    print("="*60)
+
+    from torusfold.circrna_diffusion import (
+        CircRNADiffusionModel, CircDiffusionConfig
+    )
+
+    config = CircDiffusionConfig(
+        n_diffusion_steps=min(args.diffusion_steps, 50),  # Reduce steps for stability
+        d_node=getattr(args, 'd_hidden', 128),
+        d_edge=getattr(args, 'd_hidden', 128) // 2,
+    )
+    model = CircRNADiffusionModel(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    best_val = float('inf')
+    patience_counter = 0
+
+    # Use mixed precision for numerical stability on large graphs
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
+        nan_batches = 0
+
+        for batch in train_loader:
+            seq_ids = batch['seq_ids'].to(device)
+            coords_target = batch['coords'].to(device)
+            pair_probs = batch.get('pair_probs', None)
+            if pair_probs is not None:
+                pair_probs = pair_probs.to(device)
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            # Normalize target coords to prevent numerical instability
+            B, L, _ = coords_target.shape
+            coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+            coords_scale = torch.norm(coords_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+            coords_norm = coords_centered / coords_scale
+
+            # Forward with mixed precision
+            with torch.amp.autocast('cuda', enabled=(scaler is not None)):
+                out = model(seq_tokens=seq_ids, coords_target=coords_norm, pair_probs=pair_probs)
+
+                # Extract losses from diffusion model output
+                noise_loss = out.get('noise_loss', torch.tensor(0.0, device=device))
+                closure_loss = out.get('closure_loss', torch.tensor(0.0, device=device))
+                loss = out.get('total_loss', noise_loss + 0.1 * closure_loss)
+
+            # NaN check
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            # Apply confidence weighting
+            loss = loss * conf_scale * 2.0
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+            optimizer.zero_grad()
+            train_loss += loss.item()
+
+        if nan_batches > len(train_loader) // 2:
+            print(f"  Too many NaN batches ({nan_batches}), stopping training")
+            return float('inf')
+
+        avg_train = train_loss / max(len(train_loader) - nan_batches, 1)
+
+        # Validation: use diffusion loss as proxy metric (fast, no sampling needed)
+        model.eval()
+        val_loss_sum = 0
+        n_val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                target = batch['coords'].to(device)
+                lengths = batch['lengths']
+
+                if target.abs().sum() < 1e-3:
+                    continue
+                if torch.isnan(target).any() or torch.isinf(target).any():
+                    continue
+
+                B, L = len(lengths), target.shape[1]
+
+                # Normalize target
+                target_centered = target - target.mean(dim=1, keepdim=True)
+                target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+                coords_norm = target_centered / target_scale
+
+                # Forward through diffusion model (eval mode, no grad)
+                try:
+                    with torch.amp.autocast('cuda', enabled=(device.type == 'cuda')):
+                        out = model(seq_tokens=seq_ids, coords_target=coords_norm, pair_probs=None)
+                        noise_loss = out.get('noise_loss', torch.tensor(0.0, device=device))
+                        if not (torch.isnan(noise_loss) or torch.isinf(noise_loss)):
+                            val_loss_sum += noise_loss.item()
+                            n_val_batches += 1
+                except Exception:
+                    continue
+
+        if n_val_batches > 0:
+            avg_val = val_loss_sum / n_val_batches
+        else:
+            avg_val = avg_train
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme4_best.pt")
+        else:
+            patience_counter += 1
+
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} "
+              f"val={avg_val:.4f} (n={n_val_batches}) nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val loss: {best_val:.4f}")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 5: Physics-Biased Attention
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme5(train_loader, val_loader, args, device):
+    """DEPRECATED — Physics-Biased Attention.
+
+    This scheme is unreliable with current data quality:
+    - Transformer has no geometric equivariance → coordinates can explode
+    - Physics bias is only a soft closure penalty, not true physical constraint
+    - per-sample Python loops for helical init and bond loss cause CPU bottleneck
+    - Repeated NaN/Inf issues with multiple rewrites
+
+    Consider using Scheme 4 (DDPM+EGNN) or Scheme 7 (Mamba+Transformer) instead.
+    """
+    print("\n" + "="*60)
+    print("  Scheme 5: Physics-Biased Attention [DEPRECATED]")
+    print("="*60)
+    print("  Skipping: unreliable with current data quality.")
+    print("  Use Scheme 4 (DDPM+EGNN) or Scheme 7 (Mamba+Transformer) instead.")
+    return float('inf')
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 6: GNN Latent Diffusion
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme6(train_loader, val_loader, args, device):
+    print("\n" + "="*60)
+    print("  Training Scheme 6: GNN Latent Diffusion (FIXED v3)")
+    print("="*60)
+
+    from torusfold.gnn_latent_diffusion import (
+        GNNLatentDiffusionModel, GNNLatentConfig
+    )
+
+    config = GNNLatentConfig(
+        n_diffusion_steps=args.diffusion_steps,
+        d_node=args.d_hidden,
+    )
+    model = GNNLatentDiffusionModel(config).to(device)
+
+    # Lower LR for stability
+    lr = min(args.lr, 1e-4)
+    print(f"  Using LR={lr} (capped at 1e-4)")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    best_val = float('inf')
+    patience_counter = 0
+    bond_length = 5.9
+    w_closure = 5.0
+
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
+        train_metrics = {'diff': 0, 'coord': 0, 'closure': 0, 'bond': 0}
+        nan_batches = 0
+
+        for batch in train_loader:
+            seq_ids = batch['seq_ids'].to(device)
+            target = batch['coords'].to(device)
+            lengths = batch['lengths']
+
+            # Skip batches with Inf/NaN in target coords
+            if torch.isinf(target).any() or torch.isnan(target).any():
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            B, L, _ = target.shape
+
+            # Unit-sphere normalization (same as Scheme 1)
+            target_centered = target - target.mean(dim=1, keepdim=True)
+            target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+            target_norm = target_centered / target_scale
+
+            # Forward
+            out = model(seq_ids, mode='train')
+            pred_coords = out['coords']
+            diff_loss = out.get('diffusion_loss', None)
+
+            # Normalize prediction to unit-sphere
+            pred_centered = pred_coords - pred_coords.mean(dim=1, keepdim=True)
+            pred_scale = torch.norm(pred_centered, dim=(1,2), keepdim=True).clamp(min=1e-6)
+            pred_norm = pred_centered / pred_scale
+
+            # Coordinate reconstruction loss (normalized space)
+            coord_loss = 0
+            for b in range(B):
+                valid_L = lengths[b]
+                diff = pred_norm[b, :valid_L] - target_norm[b, :valid_L]
+                coord_loss += torch.mean(diff ** 2)
+            coord_loss /= B
+
+            # Denormalize for physical losses
+            pred_denorm = pred_norm * target_scale + target.mean(dim=1, keepdim=True)
+
+            # Closure loss: BSJ distance ≈ bond_length (in Angstroms)
+            closure_dists = torch.norm(pred_denorm[:, 0] - pred_denorm[:, -1], dim=-1)
+            closure_mask = torch.tensor([lengths[b] >= 2 for b in range(B)],
+                                        device=device, dtype=torch.float32)
+            closure_loss = (closure_mask * (closure_dists - bond_length) ** 2).sum() / closure_mask.sum().clamp(min=1.0)
+
+            # Bond consistency loss
+            bond_loss = torch.tensor(0.0, device=device)
+            n_bond_samples = 0
+            for b in range(B):
+                valid_L = lengths[b]
+                if valid_L < 4:
+                    continue
+                bonds = torch.norm(
+                    pred_denorm[b, 1:valid_L] - pred_denorm[b, :valid_L-1], dim=-1
+                )
+                bsj_bond = torch.norm(pred_denorm[b, 0] - pred_denorm[b, valid_L-1])
+                all_bonds = torch.cat([bonds, bsj_bond.unsqueeze(0)])
+                bond_loss = bond_loss + F.mse_loss(all_bonds, torch.full_like(all_bonds, bond_length))
+                n_bond_samples += 1
+            bond_loss = bond_loss / max(n_bond_samples, 1)
+
+            # Total loss: coord (primary) + diffusion + closure + bond
+            if diff_loss is not None and not (torch.isnan(diff_loss) or torch.isinf(diff_loss)):
+                loss = (
+                    coord_loss * 10.0 +      # Coordinate reconstruction (primary)
+                    diff_loss * 1.0 +        # Diffusion loss
+                    closure_loss * w_closure +  # BSJ closure
+                    bond_loss * 2.0          # Bond consistency
+                )
+            else:
+                loss = coord_loss * 10.0 + closure_loss * w_closure + bond_loss * 2.0
+
+            # Apply confidence weighting
+            loss = loss * conf_scale * 2.0
+
+            # NaN check
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+
+            optimizer.step()
+            optimizer.zero_grad()
+
+            train_loss += loss.item()
+            train_metrics['diff'] += diff_loss.item() if diff_loss is not None else 0
+            train_metrics['coord'] += coord_loss.item()
+            train_metrics['closure'] += closure_loss.item()
+            train_metrics['bond'] += bond_loss.item()
+
+        n_batches = len(train_loader) - nan_batches
+        avg_train = train_loss / max(n_batches, 1)
+        avg_diff = train_metrics['diff'] / max(n_batches, 1)
+        avg_coord = train_metrics['coord'] / max(n_batches, 1)
+        avg_closure = train_metrics['closure'] / max(n_batches, 1)
+
+        # Validation: RMSD in Angstroms (with Kabsch alignment)
+        model.eval()
+        val_rmsd = 0
+        val_closure_sum = 0.0
+        n_val_samples = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                target = batch['coords'].to(device)
+                lengths = batch['lengths']
+
+                if target.abs().sum() < 1e-3 or torch.isnan(target).any() or torch.isinf(target).any():
+                    continue
+
+                B, L, _ = target.shape
+
+                # Normalize target
+                target_centered = target - target.mean(dim=1, keepdim=True)
+                target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+
+                # Forward through model (sample mode)
+                out = model(seq_ids, mode='sample')
+                pred_coords = out['coords']
+
+                if torch.isnan(pred_coords).any() or torch.isinf(pred_coords).any():
+                    continue
+
+                # Denormalize: pred_norm * target_scale + mean
+                pred_centered = pred_coords - pred_coords.mean(dim=1, keepdim=True)
+                pred_scale = torch.norm(pred_centered, dim=(1,2), keepdim=True).clamp(min=1e-6)
+                pred_norm = pred_centered / pred_scale
+                pred_denorm = pred_norm * target_scale + target.mean(dim=1, keepdim=True)
+
+                for b in range(B):
+                    valid_L = lengths[b]
+                    if valid_L < 4:
+                        continue
+                    p = pred_denorm[b, :valid_L]
+                    t = target[b, :valid_L]
+
+                    # Center for Kabsch
+                    p_c = p - p.mean(dim=0)
+                    t_c = t - t.mean(dim=0)
+
+                    if p_c.abs().sum() < 1e-6 or t_c.abs().sum() < 1e-6:
+                        continue
+
+                    rmsd = kabsch_rmsd(p_c, t_c)
+                    if not (np.isnan(rmsd) or np.isinf(rmsd)):
+                        val_rmsd += rmsd
+                        n_val_samples += 1
+
+                    closure_dist = torch.norm(pred_denorm[b, 0] - pred_denorm[b, valid_L-1]).item()
+                    val_closure_sum += closure_dist
+
+        avg_val = val_rmsd / max(n_val_samples, 1) if n_val_samples > 0 else avg_train * 100
+        avg_val_closure = val_closure_sum / max(n_val_samples, 1) if n_val_samples > 0 else float('inf')
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme6_best.pt")
+        else:
+            patience_counter += 1
+
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} (diff={avg_diff:.3f} coord={avg_coord:.3f} cls={avg_closure:.2f}) "
+              f"val={avg_val:.1f}Å closure={avg_val_closure:.2f}Å "
+              f"nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val RMSD: {best_val:.2f}Å")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 7: Mamba + Transformer Hybrid Diffusion
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme7(train_loader, val_loader, args, device):
+    """Scheme 7: Mamba + Transformer Hybrid Diffusion for circRNA.
+
+    Key advantage: O(L) global context via Mamba + O(L×w) local attention.
+    Can handle sequences up to L=1000 on 24GB GPU (vs L=500 for Scheme 4).
+
+    Memory: ~8GB for L=1000, batch=4, d=128 (vs ~25GB for Scheme 4 EGNN).
+
+    Auto-detects mamba-ssm CUDA kernels for 10-100x speedup.
+    If mamba-ssm is not installed, uses reduced config for pure-Python fallback.
+    """
+    print("\n" + "="*60)
+    print("  Training Scheme 7: Mamba+Transformer Hybrid Diffusion")
+    print("="*60)
+
+    from torusfold.circrna_mamba_diffusion import (
+        CircMambaDiffusionModel, CircMambaConfig, HAS_MAMBA_SSM
+    )
+
+    # Auto-detect: use full config if CUDA Mamba is available, reduced if pure Python
+    if HAS_MAMBA_SSM:
+        n_mamba_layers = getattr(args, 'n_mamba_layers', 4)
+        n_attn_layers = getattr(args, 'n_attn_layers', 2)
+        n_diffusion_steps = min(args.diffusion_steps, 50)
+        print(f"  CUDA Mamba detected — using full config")
+    else:
+        n_mamba_layers = min(getattr(args, 'n_mamba_layers', 4), 2)
+        n_attn_layers = min(getattr(args, 'n_attn_layers', 2), 1)
+        n_diffusion_steps = min(args.diffusion_steps, 20)
+        print(f"  NOTE: pure-Python SSM — using reduced config for speed")
+        print(f"        Install mamba-ssm with CUDA kernels for full speed")
+
+    print(f"  Config: n_mamba={n_mamba_layers}, n_attn={n_attn_layers}, n_diff={n_diffusion_steps}")
+
+    config = CircMambaConfig(
+        d_model=args.d_hidden,
+        d_ssm=max(32, args.d_hidden // 2),
+        d_cond=max(32, args.d_hidden // 2),
+        n_mamba_layers=n_mamba_layers,
+        n_attn_layers=n_attn_layers,
+        n_diffusion_steps=n_diffusion_steps,
+        attn_window=getattr(args, 'attn_window', 20),
+        bsj_flank=getattr(args, 'bsj_flank', 20),
+        bond_length=5.9,
+        closure_weight=1.0,
+        use_gradient_checkpointing=True,
+    )
+    model = CircMambaDiffusionModel(config).to(device)
+
+    # Print parameter count
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
+    print(f"  Config: d_model={config.d_model}, d_ssm={config.d_ssm}, "
+          f"n_mamba={config.n_mamba_layers}, n_attn={config.n_attn_layers}, "
+          f"window={config.attn_window}, bsj_flank={config.bsj_flank}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    best_val = float('inf')
+    patience_counter = 0
+
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
+        nan_batches = 0
+        train_metrics = {'noise': 0, 'closure': 0}
+        n_batches = len(train_loader)
+
+        for batch_idx, batch in enumerate(train_loader):
+            # Progress indicator every 10 batches
+            if batch_idx % 10 == 0:
+                print(f"\r  Training batch {batch_idx+1}/{n_batches}", end="", flush=True)
+
+            seq_ids = batch['seq_ids'].to(device)
+            coords_target = batch['coords'].to(device)
+            pair_probs = batch.get('pair_probs', None)
+            if pair_probs is not None:
+                pair_probs = pair_probs.to(device)
+            lengths = batch['lengths']
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            # Normalize target coords
+            B, L, _ = coords_target.shape
+            coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+            coords_scale = torch.norm(coords_centered, dim=(1, 2), keepdim=True).clamp(min=1.0)
+            coords_norm = coords_centered / coords_scale
+
+            # Forward: diffusion training step
+            out = model(
+                seq_tokens=seq_ids,
+                pair_probs=pair_probs,
+                coords_target=coords_norm,
+            )
+
+            noise_loss = out.get('noise_loss', torch.tensor(0.0, device=device))
+            closure_loss = out.get('closure_loss', torch.tensor(0.0, device=device))
+            loss = out.get('total_loss', noise_loss + 0.1 * closure_loss)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            # Apply confidence weighting
+            loss = loss * conf_scale * 2.0
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            train_loss += loss.item()
+            train_metrics['noise'] += noise_loss.item()
+            train_metrics['closure'] += closure_loss.item()
+
+        # Clear progress line and print epoch summary
+        print(f"\r  Training complete: {n_batches} batches, {nan_batches} NaN batches")
+
+        if nan_batches > len(train_loader) // 2:
+            print(f"  Too many NaN batches ({nan_batches}), stopping")
+            return float('inf')
+
+        n_valid_batches = max(len(train_loader) - nan_batches, 1)
+        avg_train = train_loss / n_valid_batches
+        avg_noise = train_metrics['noise'] / n_valid_batches
+        avg_closure = train_metrics['closure'] / n_valid_batches
+
+        # Validation: use training loss as proxy (skip slow sampling)
+        # Sampling with 100 diffusion steps is extremely slow with pure-Python SSM
+        # Instead, compute validation loss on a single forward pass
+        print("  Validating...", end="", flush=True)
+        model.eval()
+        val_loss = 0
+        n_val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                coords_target = batch['coords'].to(device)
+
+                # Normalize
+                coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+                coords_scale = torch.norm(coords_centered, dim=(1, 2), keepdim=True).clamp(min=1.0)
+                coords_norm = coords_centered / coords_scale
+
+                # Training-style forward (single step, no sampling)
+                out = model(seq_tokens=seq_ids, coords_target=coords_norm)
+                val_loss += out.get('total_loss', torch.tensor(0.0)).item()
+                n_val_batches += 1
+
+        avg_val = val_loss / max(n_val_batches, 1)
+        print(f" done")
+
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme7_best.pt")
+        else:
+            patience_counter += 1
+
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} "
+              f"(noise={avg_noise:.4f}, closure={avg_closure:.4f}) "
+              f"val={avg_val:.4f} nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val loss: {best_val:.4f}")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 8: Sparse Pair-Guided Hybrid Diffusion
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme8(train_loader, val_loader, args, device):
+    """Scheme 8: Sparse Pair-Guided Hybrid Diffusion for circRNA.
+
+    Key advantage: O(L·K) complexity instead of O(L²).
+    Can handle sequences up to L=2000 on 24GB GPU.
+
+    Architecture:
+      Mamba Encoder → BSJ Anchor Attention → Sparse Pair Attention (Top-K)
+      → Global Context Gate → Hybrid Denoiser (Mamba + Local Attn)
+
+    Memory: ~0.16 GB for L=1000, B=4, d=128 (vs ~2 GB for Scheme 6).
+    """
+    print("\n" + "="*60)
+    print("  Training Scheme 8: Sparse Pair-Guided Hybrid Diffusion")
+    print("="*60)
+
+    from torusfold.scheme8_sparse_pair import (
+        Scheme8Model, Scheme8Config, estimate_memory_usage, compare_scheme6_memory
+    )
+
+    # Config
+    K = getattr(args, 'scheme8_k', 20)
+    d_global = getattr(args, 'scheme8_d_global', 32)
+    bsj_flank = getattr(args, 'scheme8_bsj_flank', 30)
+    n_denoiser_blocks = getattr(args, 'scheme8_n_blocks', 4)
+    window = getattr(args, 'scheme8_window', 25)
+
+    # Auto-detect: reduce config if no CUDA Mamba
+    from torusfold.circrna_mamba_diffusion import HAS_MAMBA_SSM
+    if HAS_MAMBA_SSM:
+        n_mamba_layers = getattr(args, 'n_mamba_layers', 2)
+        n_sparse_layers = 2
+        n_diffusion_steps = min(args.diffusion_steps, 50)
+        print(f"  CUDA Mamba detected — using full config")
+    else:
+        n_mamba_layers = 1
+        n_sparse_layers = 1
+        n_diffusion_steps = min(args.diffusion_steps, 20)
+        print(f"  NOTE: pure-Python SSM — using reduced config")
+
+    config = Scheme8Config(
+        d_model=args.d_hidden,
+        d_ssm=max(32, args.d_hidden // 2),
+        d_pair=max(32, args.d_hidden // 2),
+        d_global=d_global,
+        n_mamba_layers=n_mamba_layers,
+        n_sparse_layers=n_sparse_layers,
+        n_denoiser_blocks=n_denoiser_blocks,
+        n_diffusion_steps=n_diffusion_steps,
+        K=K,
+        bsj_flank=bsj_flank,
+        attn_window=window,
+        bond_length=5.9,
+        closure_weight=1.0,
+        use_gradient_checkpointing=True,
+    )
+    model = Scheme8Model(config).to(device)
+
+    # Print parameter count and memory estimate
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Parameters: {n_params:,} ({n_params/1e6:.1f}M)")
+    print(f"  Config: d_model={config.d_model}, d_ssm={config.d_ssm}, "
+          f"K={K}, d_global={d_global}, bsj_flank={bsj_flank}, "
+          f"n_mamba={n_mamba_layers}, n_sparse={n_sparse_layers}, "
+          f"n_denoiser={n_denoiser_blocks}, window={window}")
+
+    # Memory comparison
+    for L_test in [500, 1000, 2000]:
+        mem = estimate_memory_usage(L_test, B=4, d=config.d_model, K=K, bsj_flank=bsj_flank)
+        cmp = compare_scheme6_memory(L_test)
+        print(f"  L={L_test}: S8 total={mem['total']:.3f}GB, "
+              f"S6 pair_repr={cmp['scheme6_pair_repr']:.3f}GB, "
+              f"ratio={cmp['ratio']:.1f}x")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    best_val = float('inf')
+    patience_counter = 0
+
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
+        nan_batches = 0
+        train_metrics = {'noise': 0, 'closure': 0}
+        n_batches = len(train_loader)
+
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx % 10 == 0:
+                print(f"\r  Training batch {batch_idx+1}/{n_batches}", end="", flush=True)
+
+            seq_ids = batch['seq_ids'].to(device)
+            coords_target = batch['coords'].to(device)
+            pair_probs = batch.get('pair_probs', None)
+            if pair_probs is not None:
+                pair_probs = pair_probs.to(device)
+            lengths = batch['lengths']
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            # Normalize target coords
+            B, L, _ = coords_target.shape
+            coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+            coords_scale = torch.norm(coords_centered, dim=(1, 2), keepdim=True).clamp(min=1.0)
+            coords_norm = coords_centered / coords_scale
+
+            # Forward: diffusion training step
+            out = model(
+                seq_tokens=seq_ids,
+                pair_probs=pair_probs,
+                coords_target=coords_norm,
+            )
+
+            noise_loss = out.get('noise_loss', torch.tensor(0.0, device=device))
+            closure_loss = out.get('closure_loss', torch.tensor(0.0, device=device))
+            loss = out.get('total_loss', noise_loss + 0.1 * closure_loss)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            # Apply confidence weighting
+            loss = loss * conf_scale * 2.0
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            train_loss += loss.item()
+            train_metrics['noise'] += noise_loss.item()
+            train_metrics['closure'] += closure_loss.item()
+
+        print(f"\r  Training complete: {n_batches} batches, {nan_batches} NaN batches")
+
+        if nan_batches > len(train_loader) // 2:
+            print(f"  Too many NaN batches ({nan_batches}), stopping")
+            return float('inf')
+
+        n_valid_batches = max(len(train_loader) - nan_batches, 1)
+        avg_train = train_loss / n_valid_batches
+        avg_noise = train_metrics['noise'] / n_valid_batches
+        avg_closure = train_metrics['closure'] / n_valid_batches
+
+        # Validation
+        print("  Validating...", end="", flush=True)
+        model.eval()
+        val_loss = 0
+        n_val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                coords_target = batch['coords'].to(device)
+                pair_probs = batch.get('pair_probs', None)
+                if pair_probs is not None:
+                    pair_probs = pair_probs.to(device)
+
+                coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+                coords_scale = torch.norm(coords_centered, dim=(1, 2), keepdim=True).clamp(min=1.0)
+                coords_norm = coords_centered / coords_scale
+
+                out = model(seq_tokens=seq_ids, pair_probs=pair_probs, coords_target=coords_norm)
+                val_loss += out.get('total_loss', torch.tensor(0.0)).item()
+                n_val_batches += 1
+
+        avg_val = val_loss / max(n_val_batches, 1)
+        print(f" done")
+
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme8_best.pt")
+        else:
+            patience_counter += 1
+
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} "
+              f"(noise={avg_noise:.4f}, closure={avg_closure:.4f}) "
+              f"val={avg_val:.4f} nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val loss: {best_val:.4f}")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 10: SO(2)×SO(2) Equivariant GNN
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme10(train_loader, val_loader, args, device):
+    """Scheme 10: SO(2)×SO(2) Steerable GNN Trunk.
+
+    Architecture:
+      - Token embedding (no frozen LM)
+      - Torus positional encoding
+      - SO(2)×SO(2) steerable GNN layers (irrep decomposition)
+      - Edge category builder (BACKBONE/STEM/CROSSOVER/PSEUDOKNOT/NONE)
+      - TorusCoordPredictor → (θ, φ, r) → (x, y, z) with structural closure
+      - Optional: immune head hook (external attachment)
+
+    Key advantage: True group equivariance is a constructive property,
+    not a loss term. No data augmentation needed to approximate SO(2)×SO(2)
+    symmetry.
+
+    Memory: ~0.83GB for L=256, B=8, d=64 (local smoke test). CPU-friendly.
+    """
+    print("\n" + "="*60)
+    print("  Training Scheme 10: SO(2)×SO(2) Equivariant GNN Trunk")
+    print("="*60)
+
+    from torusfold.scheme10_circ_equivariant_gnn import (
+        Scheme10Model, Scheme10Config
+    )
+
+    config = Scheme10Config(
+        d_model=args.d_hidden,
+        d_pair=args.d_hidden,
+        n_layers=args.n_mamba_layers,  # Reuse Mamba layer count as GNN depth
+        n_edge_cats=5,
+        bond_length=5.9,
+        r_scale=0.5,
+    )
+    model = Scheme10Model(config).to(device)
+
+    # Scheme 10 is trunk-only mode (no immune head by default in S10 model).
+    # Closure is guaranteed by construction (last residue reuses first's (θ,φ,r)),
+    # so closure loss in training is redundant (kept for compatibility).
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Parameters: {n_params:,} ({n_params/1e6:.2f}M)")
+    print(f"  Config: d_model={config.d_model}, n_layers={config.n_layers}, "
+          f"bond_length={config.bond_length} A, r_scale={config.r_scale}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr * 0.5, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+
+    best_val = float('inf')
+    patience_counter = 0
+    bond_length = 5.9
+    w_closure = getattr(args, 'w_closure', 5.0)
+
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0
+        train_metrics = {'coord': 0, 'closure': 0}
+        nan_batches = 0
+        n_batches = len(train_loader)
+
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx % 10 == 0:
+                print(f"\r  Training batch {batch_idx+1}/{n_batches}", end="", flush=True)
+
+            seq_ids = batch['seq_ids'].to(device)
+            coords_target = batch['coords'].to(device)
+            pair_probs = batch.get('pair_probs', None)
+            if pair_probs is not None:
+                pair_probs = pair_probs.to(device)
+            lengths = batch['lengths']
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            # Normalize target coords
+            B, L, _ = coords_target.shape
+            coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+            coords_scale = torch.norm(coords_centered, dim=(1, 2), keepdim=True).clamp(min=1.0)
+            coords_norm = coords_centered / coords_scale
+
+            # Forward
+            out = model(seq_tokens=seq_ids, pair_probs=pair_probs, coords_target=coords_norm)
+
+            coord_loss = out.get('coord_loss', torch.tensor(0.0, device=device))
+            closure_loss = out.get('closure_loss', torch.tensor(0.0, device=device))
+            loss = out.get('total_loss', coord_loss + 0.1 * closure_loss)
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            loss = loss * conf_scale * 2.0
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+            train_loss += loss.item()
+            train_metrics['coord'] += coord_loss.item()
+            train_metrics['closure'] += closure_loss.item()
+
+        print(f"\r  Training complete: {n_batches} batches, {nan_batches} NaN batches")
+
+        if nan_batches > len(train_loader) // 2:
+            print(f"  Too many NaN batches ({nan_batches}), stopping")
+            return float('inf')
+
+        avg_train = train_loss / max(len(train_loader) - nan_batches, 1)
+        avg_coord = train_metrics['coord'] / max(len(train_loader) - nan_batches, 1)
+        avg_closure = train_metrics['closure'] / max(len(train_loader) - nan_batches, 1)
+
+        print("  Validating...", end="", flush=True)
+        model.eval()
+        val_loss = 0
+        n_val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                coords_target = batch['coords'].to(device)
+                pair_probs = batch.get('pair_probs', None)
+                if pair_probs is not None:
+                    pair_probs = pair_probs.to(device)
+
+                coords_centered = coords_target - coords_target.mean(dim=1, keepdim=True)
+                coords_scale = torch.norm(coords_centered, dim=(1, 2), keepdim=True).clamp(min=1.0)
+                coords_norm = coords_centered / coords_scale
+
+                out = model(seq_tokens=seq_ids, pair_probs=pair_probs, coords_target=coords_norm)
+                val_loss += out.get('total_loss', torch.tensor(0.0)).item()
+                n_val_batches += 1
+
+        avg_val = val_loss / max(n_val_batches, 1)
+        print(f" done")
+
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme10_best.pt")
+            # Sidecar config snapshot — lets the server's weight_loader
+            # rebuild the exact Scheme10Config that produced these weights,
+            # without guessing. See server/weight_loader.py.
+            config_path = f"{args.output}/scheme10_best.config.json"
+            with open(config_path, "w", encoding="utf-8") as cfg_fh:
+                json.dump(dataclasses.asdict(config), cfg_fh, ensure_ascii=False, indent=2)
+        else:
+            patience_counter += 1
+
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} "
+              f"(coord={avg_coord:.4f}, cls={avg_closure:.4f}) "
+              f"val={avg_val:.4f} nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val loss: {best_val:.4f}")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme 2 & 3: Non-parametric (no training needed)
+# ═══════════════════════════════════════════════════════════════
+
+def train_scheme2(args):
+    """Scheme 2 is physics-based sampling, no neural network training."""
+    print("\n" + "="*60)
+    print("  Scheme 2: Batch+Physics Filter (no training needed)")
+    print("="*60)
+    print("  This scheme uses constraint_solver directly.")
+    print("  Skipping training, will use solver at inference time.")
+    return 0.0
+
+
+def train_scheme3(train_loader, val_loader, args, device):
+    """Scheme 3: Dual-Engine with Best-Model Teacher.
+
+    DEFERRED — Train other schemes first, then use the best-performing model
+    as the teacher/init for Scheme 3's EGNN refinement.
+
+    Rationale:
+    - AF3 has steric clash issues (Stein et al. 2024), not reliable as teacher
+    - S2 (GeometricConstraintSolver) RMSD ~25Å on real data, too poor as teacher
+    - Best strategy: train S1/S6/S7 first, pick winner, use it as init
+
+    To train S3 after other schemes are done:
+        python train_all_schemes.py --schemes 3 --teacher-model models/torusfold/scheme6_best.pt
+    """
+    teacher_path = getattr(args, 'teacher_model', '')
+
+    if not teacher_path or not os.path.exists(teacher_path):
+        print("\n" + "="*60)
+        print("  Scheme 3: Dual-Engine (DEFERRED — waiting for best model)")
+        print("="*60)
+        print("  No --teacher-model specified or file not found.")
+        print("  Train other schemes first, then run:")
+        print("    python train_all_schemes.py --schemes 3 \\")
+        print("      --teacher-model models/torusfold/scheme6_best.pt")
+        print()
+        print("  S3 will use the best model's predictions as initialization")
+        print("  for EGNN refinement (small delta prediction on high-quality init).")
+        return float('inf')
+
+    print("\n" + "="*60)
+    print("  Training Scheme 3: Dual-Engine (Best-Model → EGNN Refinement)")
+    print("="*60)
+    print(f"  Teacher model: {teacher_path}")
+
+    # Load teacher model for generating initializations
+    # Try each scheme model type until one loads successfully
+    teacher_model = None
+    teacher_scheme = None
+
+    # Try Scheme 6 (GNN Latent Diffusion)
+    try:
+        from torusfold.gnn_latent_diffusion import (
+            GNNLatentDiffusionModel, GNNLatentConfig
+        )
+        config = GNNLatentConfig(d_node=args.d_hidden)
+        teacher_model = GNNLatentDiffusionModel(config).to(device)
+        teacher_model.load_state_dict(torch.load(teacher_path, map_location=device, weights_only=False))
+        teacher_model.eval()
+        teacher_scheme = 6
+        print(f"  Loaded teacher as Scheme 6 (GNN Latent Diffusion)")
+    except Exception:
+        pass
+
+    # Try Scheme 1 (EGNN)
+    if teacher_model is None:
+        try:
+            teacher_model = Scheme1Model(d_hidden=args.d_hidden, n_layers=args.n_layers).to(device)
+            teacher_model.load_state_dict(torch.load(teacher_path, map_location=device, weights_only=False))
+            teacher_model.eval()
+            teacher_scheme = 1
+            print(f"  Loaded teacher as Scheme 1 (EGNN)")
+        except Exception:
+            pass
+
+    if teacher_model is None:
+        print(f"  ERROR: Could not load teacher model from {teacher_path}")
+        print(f"  Supported formats: Scheme 1 (EGNN), Scheme 6 (GNN Latent Diffusion)")
+        return float('inf')
+
+    # Build EGNN refinement model
+    class Scheme3DualEngine(nn.Module):
+        """EGNN refinement on teacher-initialized coordinates."""
+        def __init__(self, d_hidden=128, n_layers=3):
+            super().__init__()
+            self.embed = nn.Embedding(5, d_hidden)
+            self.coord_proj = nn.Linear(3, d_hidden)
+            from torusfold.train_torusfold_3d import EGNNLayer
+            self.egnn_layers = nn.ModuleList([
+                EGNNLayer(d_hidden) for _ in range(n_layers)
+            ])
+            self.delta_head = nn.Sequential(
+                nn.Linear(d_hidden, d_hidden // 2),
+                nn.SiLU(),
+                nn.Linear(d_hidden // 2, 3),
+            )
+            nn.init.zeros_(self.delta_head[-1].bias)
+            nn.init.xavier_uniform_(self.delta_head[-1].weight, gain=0.01)
+
+        def forward(self, seq_ids, coords_init):
+            B, L, _ = coords_init.shape
+            seq_feat = self.embed(seq_ids)
+            coord_feat = self.coord_proj(coords_init)
+            h = seq_feat + coord_feat
+            x = coords_init.clone()
+            for layer in self.egnn_layers:
+                h, x = layer(h, x)
+            delta = self.delta_head(h)
+            return x + delta
+
+    model = Scheme3DualEngine(
+        d_model=args.d_hidden,
+        n_layers=min(args.n_layers, 3),
+    ).to(device)
+
+    lr = min(args.lr, 5e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5
+    )
+    warmup_epochs = 5
+    bond_length = 5.9
+    print(f"  LR={lr:.1e}, warmup={warmup_epochs}")
+
+    # Pre-compute teacher initializations
+    print("  Pre-computing teacher initializations...")
+    init_cache = {}
+
+    best_val = float('inf')
+    patience_counter = 0
+
+    for epoch in range(args.epochs):
+        if epoch < warmup_epochs:
+            warmup_factor = (epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr * warmup_factor
+
+        model.train()
+        train_loss = 0
+        train_rmsd_sum = 0.0
+        train_closure_sum = 0.0
+        n_train_batches = 0
+        nan_batches = 0
+
+        for batch in train_loader:
+            seq_ids = batch['seq_ids'].to(device)
+            target = batch['coords'].to(device)
+            lengths = batch['lengths']
+
+            if torch.isinf(target).any() or torch.isnan(target).any():
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            B, L, _ = target.shape
+            conf_scale = batch.get('confidence', torch.tensor(0.5)).mean().item()
+
+            # Generate teacher initializations
+            coords_init = torch.zeros(B, L, 3, device=device)
+            for b in range(B):
+                valid_L = lengths[b]
+                seq_str = ''.join(['AUCG'[s] if s < 4 else 'N' for s in seq_ids[b, :valid_L].tolist()])
+                cache_key = (seq_str, valid_L)
+
+                if cache_key not in init_cache:
+                    with torch.no_grad():
+                        try:
+                            if teacher_scheme == 6:
+                                out = teacher_model(seq_ids[b:b+1, :valid_L], mode='inference')
+                            else:
+                                out = teacher_model(seq_ids[b:b+1, :valid_L])
+                            teacher_coords = out['coords'][0].cpu().numpy()
+                            if np.isnan(teacher_coords).any() or np.isinf(teacher_coords).any():
+                                raise ValueError("NaN/Inf in teacher output")
+                            init_cache[cache_key] = teacher_coords
+                        except Exception:
+                            # Fallback: regular polygon
+                            R = valid_L * bond_length / (2 * np.pi)
+                            fallback = np.zeros((valid_L, 3), dtype=np.float32)
+                            for i in range(valid_L):
+                                angle = 2 * np.pi * i / valid_L
+                                fallback[i, 0] = R * np.cos(angle)
+                                fallback[i, 1] = R * np.sin(angle)
+                            init_cache[cache_key] = fallback
+
+                init_np = init_cache[cache_key]
+                init_tensor = torch.tensor(init_np, dtype=torch.float32, device=device)
+                if init_tensor.shape[0] < L:
+                    pad = init_tensor[-1:].expand(L - init_tensor.shape[0], -1)
+                    init_tensor = torch.cat([init_tensor, pad], dim=0)
+                elif init_tensor.shape[0] > L:
+                    init_tensor = init_tensor[:L]
+                coords_init[b] = init_tensor
+
+            # Normalize
+            target_centered = target - target.mean(dim=1, keepdim=True)
+            target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+            target_norm = target_centered / target_scale
+            init_centered = coords_init - coords_init.mean(dim=1, keepdim=True)
+            init_norm = init_centered / target_scale
+
+            coords_refined = model(seq_ids, init_norm)
+
+            if torch.isnan(coords_refined).any() or torch.isinf(coords_refined).any():
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            # Coord loss
+            coord_loss = 0
+            for b in range(B):
+                valid_L = lengths[b]
+                pred_c = coords_refined[b, :valid_L] - coords_refined[b, :valid_L].mean(dim=0)
+                tgt_c = target_norm[b, :valid_L] - target_norm[b, :valid_L].mean(dim=0)
+                coord_loss += torch.mean(torch.sum((pred_c - tgt_c) ** 2, dim=1))
+            coord_loss /= B
+
+            # Closure loss
+            pred_denorm = coords_refined * target_scale + target.mean(dim=1, keepdim=True)
+
+            closure_dists = torch.norm(pred_denorm[:, 0] - pred_denorm[:, -1], dim=-1)
+            closure_mask = torch.tensor([lengths[b] >= 2 for b in range(B)],
+                                        device=device, dtype=torch.float32)
+            closure_loss = (closure_mask * (closure_dists - bond_length) ** 2).sum() / closure_mask.sum().clamp(min=1.0)
+
+            # Bond loss
+            bond_loss = torch.tensor(0.0, device=device)
+            n_bond = 0
+            for b in range(B):
+                valid_L = lengths[b]
+                if valid_L < 4:
+                    continue
+                bonds = torch.norm(pred_denorm[b, 1:valid_L] - pred_denorm[b, :valid_L-1], dim=-1)
+                bsj_bond = torch.norm(pred_denorm[b, 0] - pred_denorm[b, valid_L-1])
+                all_bonds = torch.cat([bonds, bsj_bond.unsqueeze(0)])
+                bond_loss = bond_loss + F.mse_loss(all_bonds, torch.full_like(all_bonds, bond_length))
+                n_bond += 1
+            bond_loss = bond_loss / max(n_bond, 1)
+
+            loss = coord_loss + 5.0 * closure_loss + 0.5 * bond_loss
+            loss = loss * conf_scale * 2.0
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            optimizer.zero_grad()
+            loss.backward()
+            has_nan_grad = any(
+                p.grad is not None and torch.isnan(p.grad).any()
+                for p in model.parameters()
+            )
+            if has_nan_grad:
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            n_train_batches += 1
+            train_loss += loss.item()
+            with torch.no_grad():
+                valid_closure = closure_dists[closure_mask.bool()]
+                if len(valid_closure) > 0:
+                    train_closure_sum += valid_closure.mean().item()
+                for b in range(B):
+                    valid_L = lengths[b]
+                    if valid_L < 4:
+                        continue
+                    p = pred_denorm[b, :valid_L]
+                    t = target[b, :valid_L]
+                    p_c = p - p.mean(dim=0)
+                    t_c = t - t.mean(dim=0)
+                    if p_c.abs().sum() > 1e-6 and t_c.abs().sum() > 1e-6:
+                        rmsd = kabsch_rmsd(p_c, t_c)
+                        if not (np.isnan(rmsd) or np.isinf(rmsd)):
+                            train_rmsd_sum += rmsd
+
+        if nan_batches > len(train_loader) // 2:
+            print(f"  Too many NaN batches ({nan_batches}), stopping")
+            return float('inf')
+
+        avg_train = train_loss / max(n_train_batches, 1)
+        avg_train_rmsd = train_rmsd_sum / max(n_train_batches, 1) if n_train_batches > 0 else float('inf')
+        avg_train_closure = train_closure_sum / max(n_train_batches, 1)
+
+        # Validation
+        model.eval()
+        val_rmsd = 0
+        val_closure_sum = 0.0
+        n_val_samples = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                seq_ids = batch['seq_ids'].to(device)
+                target = batch['coords'].to(device)
+                lengths = batch['lengths']
+
+                if torch.isnan(target).any() or torch.isinf(target).any():
+                    continue
+                if target.abs().sum() < 1e-3:
+                    continue
+
+                B, L, _ = target.shape
+
+                coords_init = torch.zeros(B, L, 3, device=device)
+                for b in range(B):
+                    valid_L = lengths[b]
+                    seq_str = ''.join(['AUCG'[s] if s < 4 else 'N' for s in seq_ids[b, :valid_L].tolist()])
+                    cache_key = (seq_str, valid_L)
+
+                    if cache_key not in init_cache:
+                        try:
+                            if teacher_scheme == 6:
+                                out = teacher_model(seq_ids[b:b+1, :valid_L], mode='inference')
+                            else:
+                                out = teacher_model(seq_ids[b:b+1, :valid_L])
+                            teacher_coords = out['coords'][0].cpu().numpy()
+                            if np.isnan(teacher_coords).any() or np.isinf(teacher_coords).any():
+                                raise ValueError("NaN/Inf")
+                            init_cache[cache_key] = teacher_coords
+                        except Exception:
+                            R = valid_L * bond_length / (2 * np.pi)
+                            fallback = np.zeros((valid_L, 3), dtype=np.float32)
+                            for i in range(valid_L):
+                                angle = 2 * np.pi * i / valid_L
+                                fallback[i, 0] = R * np.cos(angle)
+                                fallback[i, 1] = R * np.sin(angle)
+                            init_cache[cache_key] = fallback
+
+                    init_np = init_cache[cache_key]
+                    init_tensor = torch.tensor(init_np, dtype=torch.float32, device=device)
+                    if init_tensor.shape[0] < L:
+                        pad = init_tensor[-1:].expand(L - init_tensor.shape[0], -1)
+                        init_tensor = torch.cat([init_tensor, pad], dim=0)
+                    elif init_tensor.shape[0] > L:
+                        init_tensor = init_tensor[:L]
+                    coords_init[b] = init_tensor
+
+                target_centered = target - target.mean(dim=1, keepdim=True)
+                target_scale = torch.norm(target_centered, dim=(1,2), keepdim=True).clamp(min=1.0)
+                init_centered = coords_init - coords_init.mean(dim=1, keepdim=True)
+                init_norm = init_centered / target_scale
+
+                coords_refined = model(seq_ids, init_norm)
+
+                if torch.isnan(coords_refined).any() or torch.isinf(coords_refined).any():
+                    continue
+
+                pred_denorm = coords_refined * target_scale + target.mean(dim=1, keepdim=True)
+
+                for b in range(B):
+                    valid_L = lengths[b]
+                    if valid_L < 4:
+                        continue
+                    p = pred_denorm[b, :valid_L]
+                    t = target[b, :valid_L]
+                    p_c = p - p.mean(dim=0)
+                    t_c = t - t.mean(dim=0)
+                    if p_c.abs().sum() < 1e-6 or t_c.abs().sum() < 1e-6:
+                        continue
+                    rmsd = kabsch_rmsd(p_c, t_c)
+                    if not (np.isnan(rmsd) or np.isinf(rmsd)):
+                        val_rmsd += rmsd
+                        n_val_samples += 1
+                    closure_dist = torch.norm(pred_denorm[b, 0] - pred_denorm[b, valid_L-1]).item()
+                    val_closure_sum += closure_dist
+
+        avg_val = val_rmsd / max(n_val_samples, 1) if n_val_samples > 0 else avg_train * 100
+        avg_val_closure = val_closure_sum / max(n_val_samples, 1) if n_val_samples > 0 else float('inf')
+        scheduler.step(avg_val)
+
+        if avg_val < best_val:
+            best_val = avg_val
+            patience_counter = 0
+            torch.save(model.state_dict(), f"{args.output}/scheme3_best.pt")
+        else:
+            patience_counter += 1
+
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"  Epoch {epoch+1}/{args.epochs} train={avg_train:.4f} rmsd={avg_train_rmsd:.1f}Å "
+              f"closure={avg_train_closure:.2f}Å "
+              f"val={avg_val:.1f}Å val_closure={avg_val_closure:.2f}Å "
+              f"lr={current_lr:.1e} nan={nan_batches} pat={patience_counter}/10")
+
+        if patience_counter >= 10:
+            print(f"  Early stopping at epoch {epoch+1}")
+            break
+
+    print(f"  Best val: {best_val:.4f}")
+    print(f"  Init cache size: {len(init_cache)}")
+    return best_val
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scheme-specific Data Requirements
+# ═══════════════════════════════════════════════════════════════
+
+# Scheme-specific max sequence length (O(L^2) schemes need lower limits)
+SCHEME_MAX_LEN = {
+    1: 1000,  # EGNN with k-NN sparse edges, O(k*L) memory
+    2: None,  # Pure physics, no limit
+    3: 800,   # Dual-engine EGNN (solver init + EGNN refinement)
+    4: 500,   # EGNN - reduce to 500 to prevent scatter_add NaN in backward
+    5: None,  # DEPRECATED — not used
+    6: 800,   # GNN O(L^2) - A800 can handle
+    7: None,  # Mamba O(L) + O(L*w), no limit
+    8: None,  # Sparse pair O(L*K), no limit — designed for L>500
+    10: None, # SO(2)×SO(2) steerable GNN O(L*K), no limit — designed for L>500
+}
+
+SCHEME_DATA_REQUIREMENTS = {
+    1: {'min_samples': 200, 'recommended': 500, 'epochs': 50,  'reason': 'EGNN轻量，Physics部分无需训练'},
+    2: {'min_samples': 0,   'recommended': 0,   'epochs': 0,   'reason': '纯物理求解器，无需训练'},
+    3: {'min_samples': 300, 'recommended': 500, 'epochs': 50,  'reason': '双引擎：需先训练其他scheme，用最优模型做teacher'},
+    4: {'min_samples': 500, 'recommended': 1000,'epochs': 100, 'reason': '扩散模型需要大量数据'},
+    5: {'min_samples': 0,   'recommended': 0,   'epochs': 0,   'reason': 'DEPRECATED — Transformer无几何归纳偏置'},
+    6: {'min_samples': 500, 'recommended': 1000,'epochs': 100, 'reason': 'Encoder+Diffusion+Decoder最重'},
+    7: {'min_samples': 500, 'recommended': 1000,'epochs': 100, 'reason': 'Mamba+Transformer混合扩散，O(L)可处理长序列'},
+    8: {'min_samples': 500, 'recommended': 1000,'epochs': 100, 'reason': '稀疏配对混合扩散，O(L·K)可处理L>500长序列'},
+    10: {'min_samples': 500, 'recommended': 1000,'epochs': 100, 'reason': 'SO(2)×SO(2)等变GNN，O(L·K)，长序列设计目标'},
+}
+
+def main():
+    parser = argparse.ArgumentParser(description='Train all TorusFold schemes')
+    parser.add_argument('--schemes', type=int, nargs='+', default=[1, 2, 3, 4, 5, 6, 7, 8])
+    parser.add_argument('--labels', type=str, default='',
+                        help='Path to pre-generated labels directory. '
+                             'Auto-searches data/circbase_real_3d, data/circrna_3d_merged if empty.')
+    parser.add_argument('--n-train', type=int, default=500,
+                        help='Number of samples (only used if no labeled data found)')
+    parser.add_argument('--min-len', type=int, default=30)
+    parser.add_argument('--max-len', type=int, default=0,
+                        help='Maximum sequence length (0=no limit, load all data). '
+                             'Schemes 1-6 auto-limit to 500 internally due to O(L^2).')
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=8)
+    parser.add_argument('--device', type=str, default='auto')
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--d-hidden', type=int, default=128)
+    parser.add_argument('--n-layers', type=int, default=4)
+    parser.add_argument('--diffusion-steps', type=int, default=100)
+    parser.add_argument('--n-mamba-layers', type=int, default=4,
+                        help='Number of Mamba layers for Scheme 7')
+    parser.add_argument('--n-attn-layers', type=int, default=2,
+                        help='Number of local attention layers for Scheme 7')
+    parser.add_argument('--attn-window', type=int, default=20,
+                        help='Local attention window size for Scheme 7')
+    parser.add_argument('--bsj-flank', type=int, default=20,
+                        help='BSJ flanking region size for Scheme 7')
+    parser.add_argument('--scheme8-k', type=int, default=20,
+                        help='Top-K pair candidates per position for Scheme 8 (default: 20)')
+    parser.add_argument('--scheme8-d-global', type=int, default=32,
+                        help='Global context dimension for Scheme 8 (default: 32)')
+    parser.add_argument('--scheme8-bsj-flank', type=int, default=30,
+                        help='BSJ flanking region size for Scheme 8 (default: 30)')
+    parser.add_argument('--scheme8-n-blocks', type=int, default=4,
+                        help='Number of hybrid denoiser blocks for Scheme 8 (default: 4)')
+    parser.add_argument('--scheme8-window', type=int, default=25,
+                        help='Local attention window size for Scheme 8 (default: 25)')
+    parser.add_argument('--output', type=str, default='models/torusfold')
+    parser.add_argument('--w-closure', type=float, default=5.0,
+                        help='Closure penalty weight for Scheme 1 (default: 5.0)')
+    parser.add_argument('--teacher-model', type=str, default='',
+                        help='Path to best model checkpoint for Scheme 3 teacher init')
+    parser.add_argument('--seed', type=int, default=42)
+    args = parser.parse_args()
+
+    if args.device == 'auto':
+        args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    os.makedirs(args.output, exist_ok=True)
+
+    print("="*60)
+    print("  TorusFold Multi-Scheme Training")
+    print("="*60)
+    print(f"  Schemes: {args.schemes}")
+
+    # Load labeled data (auto-search if --labels not specified)
+    labels_dir = args.labels
+    if not labels_dir:
+        # Auto-search for existing labeled data directories
+        # Search relative to script location AND cwd
+        script_dir = str(Path(__file__).resolve().parents[4])
+        search_paths = [
+            'data/circrna_3d_merged',      # Merged dataset (best)
+            'data/circbase_real_3d',        # IsRNAcirc + augmented
+            'data/pdb_circrna',             # PDB circularized
+            'data/shape_3d',                # icSHAPE-constrained
+            os.path.join(script_dir, 'data/circrna_3d_merged'),
+            os.path.join(script_dir, 'data/circbase_real_3d'),
+            os.path.join(script_dir, 'data/pdb_circrna'),
+            os.path.join(script_dir, 'data/shape_3d'),
+            '/root/data/circrna_3d_merged',  # AutoDL common mount
+            '/root/data/circbase_real_3d',
+            '/autodl-tmp/data/circrna_3d_merged',  # AutoDL tmp mount
+            '/autodl-tmp/data/circbase_real_3d',
+        ]
+        for candidate in search_paths:
+            seq_file = os.path.join(candidate, 'sequences.json')
+            if os.path.exists(seq_file):
+                labels_dir = candidate
+                print(f"  Auto-detected labeled data: {candidate}")
+                break
+
+    if labels_dir and os.path.exists(labels_dir):
+        print(f"  Loading from: {labels_dir}")
+        max_len_filter = args.max_len if args.max_len > 0 else None
+        sequences, coords_labels, pair_labels, confidence_weights, metadata = load_pseudo_labels(
+            labels_dir, max_len=max_len_filter)
+    else:
+        print(f"  WARNING: No labeled data found. Generating synthetic pseudo-labels (n={args.n_train})")
+        print(f"           For better results, run data collection first:")
+        print(f"           python -m torusfold.merge_expanded_dataset --output data/circrna_3d_merged")
+        gen_max_len = args.max_len if args.max_len > 0 else 500
+        sequences, coords_labels, pair_labels, metadata = generate_3d_pseudo_labels(
+            n_seqs=args.n_train,
+            min_len=args.min_len,
+            max_len=gen_max_len,
+            seed=args.seed
+        )
+        # Generated data has uniform confidence
+        confidence_weights = [0.3] * len(sequences)
+
+    if len(sequences) < 10:
+        print("ERROR: Not enough pseudo-labels.")
+        return
+
+    print(f"  Training samples: {len(sequences)}")
+    print(f"  Device: {args.device}")
+
+    # Print data requirements per scheme
+    print(f"\n  Scheme data requirements:")
+    for sid in args.schemes:
+        req = SCHEME_DATA_REQUIREMENTS.get(sid, {})
+        avail = len(sequences) if req.get('min_samples', 0) > 0 else 'N/A'
+        needed = req.get('recommended', 0)
+        status = 'OK' if req.get('min_samples', 0) == 0 or len(sequences) >= req.get('min_samples', 0) else 'LOW'
+        print(f"    Scheme {sid}: need {needed}, have {avail} [{status}] - {req.get('reason', '')}")
+
+    # Train each scheme with its own data subset
+    results = {}
+    device = torch.device(args.device)
+
+    for scheme_id in args.schemes:
+        req = SCHEME_DATA_REQUIREMENTS.get(scheme_id, {})
+
+        # Scheme 2: no training needed (pure physics solver)
+        # Scheme 5: DEPRECATED — skip training
+        if scheme_id == 2:
+            t0 = time.time()
+            val_loss = train_scheme2(args)
+            elapsed = time.time() - t0
+            results[scheme_id] = {'val_loss': val_loss, 'time_seconds': elapsed}
+            continue
+        if scheme_id == 5:
+            print(f"\n  Scheme 5: DEPRECATED — skipping (use S4 or S7 instead)")
+            results[scheme_id] = {'val_loss': float('inf'), 'time_seconds': 0, 'reason': 'DEPRECATED'}
+            continue
+
+        # Scheme-specific length filtering
+        scheme_max_len = SCHEME_MAX_LEN.get(scheme_id)
+        if scheme_max_len is not None:
+            keep = [i for i, m in enumerate(metadata) if m['length'] <= scheme_max_len]
+            seq_s = [sequences[i] for i in keep]
+            coord_s = [coords_labels[i] for i in keep]
+            pair_s = [pair_labels[i] for i in keep]
+            conf_s = [confidence_weights[i] for i in keep]
+            n_filtered = len(keep)
+            if n_filtered < len(sequences):
+                print(f"\n  Scheme {scheme_id}: filtered {len(sequences)} -> {n_filtered} "
+                      f"(max_len={scheme_max_len})")
+        else:
+            seq_s = sequences
+            coord_s = coords_labels
+            pair_s = pair_labels
+            conf_s = confidence_weights
+            n_filtered = len(sequences)
+            print(f"\n  Scheme {scheme_id}: using all {n_filtered} samples (no length limit)")
+
+        # Determine how many samples this scheme uses
+        n_available = n_filtered
+        n_use = n_available  # Use all available data
+
+        # Warn if data is insufficient
+        if n_available < req.get('min_samples', 0):
+            print(f"\n  WARNING: Scheme {scheme_id} needs {req['min_samples']} samples, "
+                  f"only {n_available} available. Results may be poor.")
+
+        # Split for this scheme
+        split = int(0.9 * n_use)
+        train_ds = CircRNADataset(
+            seq_s[:split], coord_s[:split], pair_s[:split], conf_s[:split])
+        val_ds = CircRNADataset(
+            seq_s[split:n_use], coord_s[split:n_use], pair_s[split:n_use], conf_s[split:n_use])
+
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                                  shuffle=True, collate_fn=collate_fn,
+                                  num_workers=2, pin_memory=True, prefetch_factor=2)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                                shuffle=False, collate_fn=collate_fn,
+                                num_workers=2, pin_memory=True, prefetch_factor=2)
+
+        # Use scheme-specific epochs if not overridden
+        scheme_epochs = args.epochs
+        if args.epochs == 50:  # Default, use scheme-specific
+            scheme_epochs = req.get('epochs', 50)
+
+        # Temporarily override epochs
+        original_epochs = args.epochs
+        args.epochs = scheme_epochs
+
+        t0 = time.time()
+
+        if scheme_id == 1:
+            val_loss = train_scheme1(train_loader, val_loader, args, device)
+        elif scheme_id == 3:
+            val_loss = train_scheme3(train_loader, val_loader, args, device)
+        elif scheme_id == 4:
+            val_loss = train_scheme4(train_loader, val_loader, args, device)
+        elif scheme_id == 5:
+            val_loss = train_scheme5(train_loader, val_loader, args, device)
+        elif scheme_id == 6:
+            val_loss = train_scheme6(train_loader, val_loader, args, device)
+        elif scheme_id == 7:
+            val_loss = train_scheme7(train_loader, val_loader, args, device)
+        elif scheme_id == 8:
+            val_loss = train_scheme8(train_loader, val_loader, args, device)
+        elif scheme_id == 10:
+            val_loss = train_scheme10(train_loader, val_loader, args, device)
+        else:
+            print(f"  Unknown scheme {scheme_id}, skipping")
+            args.epochs = original_epochs
+            continue
+
+        args.epochs = original_epochs
+        elapsed = time.time() - t0
+        results[scheme_id] = {
+            'val_loss': val_loss,
+            'time_seconds': elapsed,
+            'n_samples': n_use,
+            'epochs': scheme_epochs,
+        }
+        print(f"  Scheme {scheme_id} completed: {n_use} samples, "
+              f"{scheme_epochs} epochs, {elapsed:.1f}s")
+
+    # Summary
+    print("\n" + "="*60)
+    print("  Training Summary")
+    print("="*60)
+    for sid, res in sorted(results.items()):
+        n_samp = res.get('n_samples', 'N/A')
+        ep = res.get('epochs', args.epochs)
+        print(f"  Scheme {sid}: val_loss={res['val_loss']:.4f}, "
+              f"samples={n_samp}, epochs={ep}, time={res['time_seconds']:.1f}s")
+
+    # Save results
+    with open(f"{args.output}/training_results.json", 'w') as f:
+        json.dump({
+            'args': vars(args),
+            'results': {str(k): v for k, v in results.items()},
+            'metadata': metadata[:50],
+        }, f, indent=2)
+
+    print(f"\n  Results saved to {args.output}/training_results.json")
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+develop-eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Weights (don't push to GitHub per project policy)
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+models/
+!models/.gitkeep
+
+# Data (synthetic/real data not in repo; consent-policy)
+data/
+*.csv
+*.tsv
+*.parquet
+*.h5
+*.hdf5
+
+# Results / outputs
+results/
+outputs/
+runs/
+wandb/
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Logs
+*.log
+logs/
+
+# 备份目录 (开发期产物, 不上 GitHub)
+_backup_pre_aform_20260720/
+
+# Claude Code / 本地配置 (含密钥/会话状态, 绝不上传)
+.claude/
+
+# 1EHZ 晶体原始 PDB (源数据, 运行时只需 aform_template.npz)
+*.pdb
+_aform_template.pdb
+
+# 根目录测试输出 JSON (开发期产物)
+/amber_e2e*.json
+/imm_smoke_out.json

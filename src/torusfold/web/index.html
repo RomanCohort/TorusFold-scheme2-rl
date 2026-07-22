@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>TorusFold — circRNA 3D Structure Server</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.css">
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>TorusFold</h1>
+    <span class="tag">circRNA 3D Structure Prediction</span>
+  </div>
+  <div class="sub" id="server-status">connecting...</div>
+</header>
+
+<div id="main">
+  <!-- 左侧：输入 + 控制 -->
+  <section class="left">
+    <div class="card">
+      <h2>Sequence</h2>
+      <textarea id="sequence" placeholder="贴 circRNA 序列（ACGU/T，10-500 nt）..." rows="6"></textarea>
+      <div class="row">
+        <span class="counter" id="seq-counter">0 nt</span>
+        <span class="error" id="seq-error"></span>
+      </div>
+      <button id="predict-btn" class="primary">Predict</button>
+    </div>
+
+    <div class="card" id="progress-card" style="display:none;">
+      <h2>Status</h2>
+      <div id="progress">idle</div>
+      <div class="method-tag" id="method-tag"></div>
+    </div>
+
+    <div class="card" id="result-card" style="display:none;">
+      <h2>Downloads</h2>
+      <div class="download-row">
+        <button id="dl-pdb" class="secondary" disabled>Download .pdb</button>
+        <button id="dl-json" class="secondary" disabled>Download .json</button>
+      </div>
+      <div class="meta" id="meta-summary"></div>
+    </div>
+
+    <div class="card" id="sequence-card" style="display:none;">
+      <h2>Sequence</h2>
+      <div class="seq-box" id="seq-box"></div>
+    </div>
+  </section>
+
+  <!-- 右侧：Mol* + 指纹面板 -->
+  <section class="right">
+    <div id="viewer-wrap">
+      <div id="viewer"></div>
+      <div id="viewer-placeholder">预测完成后 3D 结构将显示在这里</div>
+    </div>
+    <aside id="fp-panel">
+      <div class="panel">
+        <h2>Visualization</h2>
+        <label class="ctrl-label">Representation
+          <select id="repr-select">
+            <option value="cartoon">Cartoon</option>
+            <option value="ball-stick">Ball &amp; Stick</option>
+            <option value="spacefill">Spacefill</option>
+            <option value="surface" selected>Surface (frosted)</option>
+            <option value="surface+cartoon">Surface + Cartoon</option>
+          </select>
+        </label>
+        <label class="ctrl-label">Surface opacity
+          <input type="range" id="opacity-slider" min="0" max="1" step="0.05" value="0.35">
+          <span id="opacity-val">0.35</span>
+        </label>
+      </div>
+      <div class="panel">
+        <h2>Coloring Scheme</h2>
+        <select id="scheme-select" disabled></select>
+        <div class="legend" id="scheme-legend"></div>
+        <div class="gradient-bar" id="gradient-bar"></div>
+      </div>
+      <div class="panel">
+        <h2>Molecule Scalars</h2>
+        <div id="scalar-cards"></div>
+      </div>
+    </aside>
+  </section>
+</div>
+
+<footer>
+  <span>method: <code id="method-foot">—</code></span>
+  <span>closure error: <code id="closure-foot">—</code></span>
+  <span>elapsed: <code id="elapsed-foot">—</code></span>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/molstar@5.10.1/build/viewer/molstar.js"></script>
+<script src="/web/circrna_viewer.js"></script>
+<script src="/web/app.js"></script>
+</body>
+</html>

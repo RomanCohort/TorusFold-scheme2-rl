@@ -36,9 +36,10 @@ from torusfold.scheme2.pair_graph import (  # noqa: E402
     extract_stem_blocks, W,
 )
 
-CIRCBASE = r"D:\IGEM集成方案\data\circrna\circbase_seqs.fa.gz"
+CIRCBASE = r"C:\Users\颜子壹\data\circrna\human_hg19_circRNAs_putative_spliced_sequence.fa.gz"
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "rl_samples"
-MIN_LEN, MAX_LEN = 1200, 2200  # RL 甜区 (学长定: 覆盖 2013nt HA 序列; ViennaRNA pf() O(L^2) 2200nt 内存可控)
+MIN_LEN, MAX_LEN = 2000, 3200  # RL 甜区: ViennaRNA pf() 在这个区间能给真配对 (实测 2676nt=681对);
+                                # 3354nt 起 ViennaRNA 失效给 0 配对, 上限留余量到 3200 (2026-07-22 改)
 
 
 def iter_circbase(path: str, min_len: int = MIN_LEN, max_len: int = MAX_LEN):
@@ -46,7 +47,19 @@ def iter_circbase(path: str, min_len: int = MIN_LEN, max_len: int = MAX_LEN):
 
     不存全列表 (CircBase max=1.8M nt, 全存触发 MemoryError)。
     超长序列累积超 max_len 即提前 skip, 单条内存可控。
+
+    注: circBase 存 hg19 DNA 文库, 碱基用 T 不用 U; 读入时 T->U 转 RNA,
+    否则 set(s)<=set("AUGC") 过滤会把含 T 的序列全毙 (2026-07-22 修)。
     """
+    def _ok(s, L):
+        # T->U 转 RNA, 去掉 N 等非 AUGC 字符后判长度与字符集
+        s = s.replace("T", "U")
+        if not (min_len <= L <= max_len):
+            return None
+        if set(s) <= set("AUGC"):
+            return s
+        return None
+
     with gzip.open(path, "rt", encoding="utf-8") as f:
         cur: list[str] = []
         cur_len = 0
@@ -54,8 +67,8 @@ def iter_circbase(path: str, min_len: int = MIN_LEN, max_len: int = MAX_LEN):
         for line in f:
             if line.startswith(">"):
                 if not skip and cur:
-                    s = "".join(cur)
-                    if min_len <= cur_len <= max_len and set(s) <= set("AUGC"):
+                    s = _ok("".join(cur), cur_len)
+                    if s is not None:
                         yield s
                 cur = []
                 cur_len = 0
@@ -71,8 +84,8 @@ def iter_circbase(path: str, min_len: int = MIN_LEN, max_len: int = MAX_LEN):
                     else:
                         cur.append(ls)
         if not skip and cur:
-            s = "".join(cur)
-            if min_len <= cur_len <= max_len and set(s) <= set("AUGC"):
+            s = _ok("".join(cur), cur_len)
+            if s is not None:
                 yield s
 
 

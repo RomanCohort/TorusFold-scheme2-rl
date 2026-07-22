@@ -315,6 +315,12 @@ def far_end_pairs(
       - 去自身配对边的图距离 > far_dist  (不被其他配对快速连通)
 
     合并 ViennaRNA + 扫描的所有配对, 逐对判定。
+
+    降级兜底 (2026-07-22 加): 若上述强判定 0 产出, 说明配对图被扫描
+    假阳性织成小世界 (实测 circBase 4000nt+ 上拓扑距 max=4-5, 全判近端)。
+    此时拓扑孤立判失效, 降级到「环距远 且 配对来自 ViennaRNA 真配对」:
+      ring_dist > max(far_dist, L//4)  且  (i,j) ∈ vienna_pairs
+    只信 ViennaRNA 真配对, 规避扫描假阳性污染。无 ViennaRNA 时仍返回 []。
     """
     L = len(adj)
     all_pairs: Set[Tuple[int, int]] = set()
@@ -328,6 +334,7 @@ def far_end_pairs(
                 if ik != jk:
                     all_pairs.add((min(ik, jk), max(ik, jk)))
 
+    # 强判定: 环距远 且 拓扑孤立
     far = []
     for (i, j) in all_pairs:
         # 条件 1: 环距远
@@ -337,7 +344,22 @@ def far_end_pairs(
         d = topological_distance(adj, i, j, exclude_edge=(i, j))
         if d > far_dist:
             far.append((i, j))
-    return far
+
+    if far:
+        return far
+
+    # 降级: 拓扑判失效 (图织密), 改用环距 + ViennaRNA 真配对
+    vienna_set: Set[Tuple[int, int]] = {
+        (min(i, j), max(i, j)) for (i, j, _w) in vienna_pairs
+    }
+    if not vienna_set:
+        return []
+    ring_thresh = max(far_dist, L // 4)
+    far_fallback = []
+    for (i, j) in vienna_set:
+        if ring_distance(i, j, L) > ring_thresh:
+            far_fallback.append((i, j))
+    return far_fallback
 
 
 # ---------- 茎块提取 ----------

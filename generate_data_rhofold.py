@@ -138,7 +138,17 @@ class RhoFoldEngine:
             mode = "MSA" if msa_path else "SINGLE"
             print(f"    [{name}] RhoFold 模式: {mode}")
 
+        def _vram():
+            """返回当前 GPU 显存使用量 (MB), 仅诊断用."""
+            try:
+                return torch.cuda.memory_allocated() / 2**20
+            except Exception:
+                return -1
+
         fea = get_features(str(fa_path), msa_src)
+        if self.verbose:
+            print(f"    [{name}] pre-infer VRAM: {_vram():.0f}MB", flush=True)
+
         # 混合精度: autocast 自动处理 dtype 转换 (整数保持 Long, 浮点转 fp16)
         with torch.no_grad(), torch.amp.autocast("cuda", enabled=self.use_fp16):
             out = self.model(
@@ -146,13 +156,26 @@ class RhoFoldEngine:
                 rna_fm_tokens=fea["rna_fm_tokens"].to(self.device),
                 seq=fea["seq"],
             )
+        if self.verbose:
+            print(f"    [{name}] post-infer VRAM: {_vram():.0f}MB", flush=True)
+
         frames = out[-1]["frames"][0, 0].data.cpu().numpy()
         p_coords = frames[:, 4:7]
 
-        # 显式释放 GPU 中间 tensor (否则等 GC 回收, 4 worker 并发时显存累积)
+        # 激进释放 GPU 显存:
+        # 1. del out, fea — 解除 Python 引用
+        # 2. gc.collect() — 强制回收循环引用
+        # 3. synchronize() — 等待 GPU 操作完成
+        # 4. empty_cache() — 释放 PyTorch 缓存给 OS
         del out, fea
         if self.device.type == "cuda":
+            import gc
+            gc.collect()
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+        if self.verbose:
+            print(f"    [{name}] post-cleanup VRAM: {_vram():.0f}MB", flush=True)
 
         return np.asarray(p_coords, dtype=np.float64)
 
@@ -499,10 +522,12 @@ def _l1_worker_producer(args):
             print(f"  [s{idx:05d}] Level1 生产者异常: {e}")
             queue.put(None)  # 失败标记, 保证队列恒有 total 条
         finally:
-            # 每条序列后释放显存 (RhoFold 中间激活的 GPU 缓存)
+            # 每条序列后强制释放显存 (防止累积)
             try:
-                import torch
+                import torch, gc
                 if torch.cuda.is_available():
+                    gc.collect()
+                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
             except Exception:
                 pass

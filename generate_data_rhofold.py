@@ -21,7 +21,7 @@ import json
 import os
 import sys
 import time
-from multiprocessing import Pool
+from multiprocessing import Pool, Manager
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -443,16 +443,34 @@ def _get_far_pairs(ss, gap=30):
     return [(i, j) for i, j in pairs if abs(j - i) > gap]
 
 
-def _worker_batch(batch_args):
-    """批量 worker: 处理一组序列, RhoFold 引擎只加载一次.
+# 流水线共享队列 (Pool worker 经 initializer 注入, 进程继承传递)
+_L1_QUEUE = None
+
+
+def _init_l1_worker(queue):
+    """Pool worker 初始化: 把队列注入全局 (Windows spawn 只能继承不能 pickle)."""
+    global _L1_QUEUE
+    _L1_QUEUE = queue
+
+
+def _l1_worker_producer(args):
+    """Level 1 生产者: 常驻 RhoFold 引擎, 处理任务列表.
+
+    多进程并行 (每进程加载一次引擎), 把 Level 0 配对 + Level 1 坐标
+    塞进队列 (全局 _L1_QUEUE, 由 _init_l1_worker 注入), 由单线程 Level 2
+    消费者取走 (流水线重叠 GPU/CPU).
 
     Args:
-        batch_args: (tasks, work_root, max_seg_len, overlap, n_anneal, rfam_dir)
+        args: (tasks, work_root, max_seg_len, overlap, rfam_dir)
 
     Returns:
-        list of result dicts
+        None (结果通过 queue 给消费者; 失败塞 None 标记)
     """
-    tasks, work_root, max_seg_len, overlap, n_anneal, rfam_dir = batch_args
+    tasks, work_root, max_seg_len, overlap, rfam_dir = args
+    queue = _L1_QUEUE
+    if queue is None:
+        print("  [错误] worker 未初始化队列 (initializer 未注入)")
+        return
     _ensure_src()
 
     # RhoFold 引擎加载一次, 整批序列复用
@@ -463,84 +481,140 @@ def _worker_batch(batch_args):
         print(f"  [RhoFoldEngine] 加载失败: {e}, 回退子进程模式")
         engine = None
 
-    results = []
     for (idx, header, seq) in tasks:
-        name = f"s{idx:05d}"
-        wdir = Path(work_root) / name
-        wdir.mkdir(parents=True, exist_ok=True)
-
-        # Level 0: 二级结构 + 配对
-        ss = _predict_ss(seq)
-        if len(ss) != len(seq):
-            ss = ".".join(seq)
-        fp = _get_far_pairs(ss)
-        pairs_near = _dotbracket_to_pairs_list(ss)
-
-        # Level 1: 分段 RhoFold+ MSA (常驻引擎, 或子进程 fallback)
-        l1_dir = wdir / "l1_rhofold"
         try:
-            coords_vfold = level1_rhofold(
-                seq, ss, str(l1_dir), engine=engine,
-                max_seg_len=max_seg_len, overlap=overlap,
-                use_msa=True, rfam_dir=rfam_dir,
-            )
+            _l1_produce_one(
+                idx, header, seq, work_root,
+                max_seg_len, overlap, rfam_dir, engine, queue)
         except Exception as e:
-            print(f"  [{name}] Level1 RhoFold 失败: {e}")
-            results.append(None)
+            print(f"  [s{idx:05d}] Level1 生产者异常: {e}")
+            queue.put(None)  # 失败标记, 保证队列恒有 total 条
+
+
+def _l1_produce_one(idx, header, seq, work_root,
+                    max_seg_len, overlap, rfam_dir, engine, queue):
+    """Level 0 + Level 1 (单个样本), 结果塞队列."""
+    name = f"s{idx:05d}"
+    wdir = Path(work_root) / name
+    wdir.mkdir(parents=True, exist_ok=True)
+
+    # Level 0: 二级结构 + 配对
+    ss = _predict_ss(seq)
+    if len(ss) != len(seq):
+        ss = ".".join(seq)
+    fp = _get_far_pairs(ss)
+    pairs_near = _dotbracket_to_pairs_list(ss)
+
+    # Level 1: 分段 RhoFold+ MSA (常驻引擎, 或子进程 fallback)
+    l1_dir = wdir / "l1_rhofold"
+    try:
+        coords_vfold = level1_rhofold(
+            seq, ss, str(l1_dir), engine=engine,
+            max_seg_len=max_seg_len, overlap=overlap,
+            use_msa=True, rfam_dir=rfam_dir,
+        )
+    except Exception as e:
+        print(f"  [{name}] Level1 RhoFold 失败: {e}")
+        queue.put(None)
+        return
+
+    if coords_vfold is None or len(coords_vfold) != len(seq):
+        print(f"  [{name}] RhoFold 坐标异常: {None if coords_vfold is None else coords_vfold.shape}")
+        queue.put(None)
+        return
+
+    # 配对列表 (近程 + 远端), L1.5 和 L2 共用
+    all_pairs = pairs_near + [(int(i), int(j), 1.0) for (i, j) in fp]
+    seen = set()
+    all_pairs = [p for p in all_pairs
+                 if not (p[0], p[1]) in seen and not seen.add((p[0], p[1]))]
+
+    queue.put({
+        "idx": idx, "header": header, "seq": seq, "ss": ss,
+        "far_pairs": fp, "all_pairs": all_pairs,
+        "coords_vfold": coords_vfold,
+        "wdir": str(wdir), "name": name,
+    })
+
+
+def _l2_consumer(queue, done_queue, total, n_anneal, work_root):
+    """Level 2 消费者: 单进程从队列取 Level 1 结果, OpenMM 精修.
+
+    Args:
+        queue: Level 1 → Level 2 任务队列
+        done_queue: L2 → main 完成队列 (聚合进度)
+        total: 总任务数
+        n_anneal: 退火步数
+        work_root: 输出根目录
+
+    Returns:
+        None (结果通过 done_queue 返回)
+    """
+    _ensure_src()
+    results = []
+    for _ in range(total):
+        job = queue.get()
+        if job is None:
+            done_queue.put(None)
             continue
-
-        if coords_vfold is None or len(coords_vfold) != len(seq):
-            print(f"  [{name}] RhoFold 坐标异常: {None if coords_vfold is None else coords_vfold.shape}")
-            results.append(None)
-            continue
-
-        # 配对列表 (近程 + 远端), L1.5 和 L2 共用
-        all_pairs = pairs_near + [(int(i), int(j), 1.0) for (i, j) in fp]
-        seen = set()
-        all_pairs = [p for p in all_pairs
-                     if not (p[0], p[1]) in seen and not seen.add((p[0], p[1]))]
-
-        # Level 1.5: CG 弛豫 (平滑分段拼装边界, 为 Level 2 预热)
         try:
-            coords_vfold = _openmm_cg_relax_pre(
-                coords_vfold, all_pairs, n_threads=1, verbose=False)
+            r = _l2_process_one(job, n_anneal, work_root)
         except Exception as e:
-            print(f"  [{name}] Level1.5 弛豫跳过: {e}")
-
-        # Level 2: OpenMM close + 精修
-        try:
-            coords_refined, energy = _openmm_cg_relax(
-                coords_vfold, all_pairs, n_anneal=n_anneal, n_threads=1)
-        except Exception as e:
-            print(f"  [{name}] Level2 OpenMM 失败: {e}")
-            results.append(None)
-            continue
-
-        if coords_refined is None or len(coords_refined) != len(seq):
-            results.append(None)
-            continue
-
-        feat = features(coords_refined, fp)
-        np.save(str(wdir / f"{name}_p.npy"), coords_refined)
-        np.save(str(wdir / f"{name}_rhofold_p.npy"), coords_vfold)
-
-        results.append({
-            "header": header, "seq": seq, "ss": ss,
-            "far_pairs": fp, "features": feat.tolist(),
-            "n_P": len(coords_refined),
-            "energy_openmm": float(energy),
-            "pdb": str(wdir / f"{name}_refined.pdb"),
-            "npy": str(wdir / f"{name}_p.npy"),
-            "npy_rhofold": str(wdir / f"{name}_rhofold_p.npy"),
-        })
+            name = job.get("name", "?")
+            print(f"  [{name}] Level2 消费者异常: {e}")
+            r = None
+        done_queue.put(r)
+        if r is not None:
+            results.append(r)
     return results
 
 
-# 兼容单 worker (测试用)
-def _worker(args):
-    idx, header, seq, work_root, max_seg_len, overlap, n_anneal, rfam_dir = args
-    r = _worker_batch([([(idx, header, seq)], work_root, max_seg_len, overlap, n_anneal, rfam_dir)])
-    return r[0] if r else None
+def _l2_process_one(job, n_anneal, work_root):
+    """Level 1.5 + Level 2: CG 弛豫 + BSJ 闭合退火 + 特征.
+
+    在单线程消费者进程里执行 (OpenMM CPU).
+    """
+    idx = job["idx"]
+    header = job["header"]
+    seq = job["seq"]
+    ss = job["ss"]
+    fp = job["far_pairs"]
+    all_pairs = job["all_pairs"]
+    coords_vfold = job["coords_vfold"]
+    wdir = Path(job["wdir"])
+    name = job["name"]
+
+    # Level 1.5: CG 弛豫 (平滑分段拼装边界, 为 Level 2 预热)
+    try:
+        coords_vfold = _openmm_cg_relax_pre(
+            coords_vfold, all_pairs, n_threads=1, verbose=False)
+    except Exception as e:
+        print(f"  [{name}] Level1.5 弛豫跳过: {e}")
+
+    # Level 2: OpenMM close + 精修
+    try:
+        coords_refined, energy = _openmm_cg_relax(
+            coords_vfold, all_pairs, n_anneal=n_anneal, n_threads=1)
+    except Exception as e:
+        print(f"  [{name}] Level2 OpenMM 失败: {e}")
+        return None
+
+    if coords_refined is None or len(coords_refined) != len(seq):
+        return None
+
+    feat = features(coords_refined, fp)
+    np.save(str(wdir / f"{name}_p.npy"), coords_refined)
+    np.save(str(wdir / f"{name}_rhofold_p.npy"), coords_vfold)
+
+    return {
+        "header": header, "seq": seq, "ss": ss,
+        "far_pairs": fp, "features": feat.tolist(),
+        "n_P": len(coords_refined),
+        "energy_openmm": float(energy),
+        "pdb": str(wdir / f"{name}_refined.pdb"),
+        "npy": str(wdir / f"{name}_p.npy"),
+        "npy_rhofold": str(wdir / f"{name}_rhofold_p.npy"),
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -582,32 +656,63 @@ def main():
         print("all done!")
         return
 
-    # 切成 n_workers 块, 每块一个 worker 进程 (RhoFold 引擎只加载一次)
+    # 流水线: Level 1 生产者 (多进程, 常驻 RhoFold 引擎) -> Level 2 消费者 (单进程 OpenMM)
     tasks = [(i, h, s) for i, (h, s) in enumerate(seqs)]
     n_w = max(1, min(a.n_workers, len(tasks)))
     chunks = [[] for _ in range(n_w)]
     for k, t in enumerate(tasks):
         chunks[k % n_w].append(t)
-    # 均衡: 把大块匀给小块
-    batches = [(c, str(data), a.max_seg_len, a.overlap, a.n_anneal, a.rfam_dir)
+
+    # 队列: 任务队列 (L1 -> L2) + 完成队列 (L2 -> main 聚合进度)
+    # Manager().Queue 走代理, 可跨进程 (Windows spawn) 共享, 是 Pool 传 queue 的唯一正解
+    manager = Manager()
+    queue = manager.Queue(maxsize=max(2 * n_w, 8))
+    done_queue = manager.Queue()
+
+    # 每个 worker 一份任务块 (queue 不进 task 参数, 经 initializer 进程继承传递)
+    batches = [(c, str(data), a.max_seg_len, a.overlap, a.rfam_dir)
                for c in chunks if c]
-    # RhoFold 常驻引擎: 模型加载 ~2s, 每样本推理快. 估算: 每 worker ~10-30s/样本.
+
+    # 估算: L1 GPU 是瓶颈. 每样本 5-20s, 多进程并行后吞吐 ~ n_w 样本/20s.
     est = len(tasks) * 20 / n_w / 60
-    print(f"\n>>> {n_w} workers x {len(tasks)} seqs (RhoFold+MSA 常驻引擎 + OpenMM), ~{est:.0f} min\n")
+    print(f"\n>>> 流水线 {n_w} L1-producers x {len(tasks)} seqs (RhoFold+MSA 常驻引擎, L1.5+2 OpenMM 单进程消费者), ~{est:.0f} min\n")
+
+    # L2 消费者: 单进程, 从队列取, OpenMM 精修
+    from multiprocessing import Process
+    consumer = Process(
+        target=_l2_consumer,
+        args=(queue, done_queue, len(tasks), a.n_anneal, str(data)),
+        name="l2-consumer",
+    )
+    consumer.start()
 
     t0 = time.time()
     results = []
-    with Pool(n_w) as pool:
-        for r in pool.imap_unordered(_worker_batch, batches):
-            if r:
-                results.extend([x for x in r if x is not None])
-            d = len(results)
+    ok = fail = 0
+    n_done = 0
+    with Pool(n_w, initializer=_init_l1_worker, initargs=(queue,)) as pool:
+        for _ in pool.imap_unordered(_l1_worker_producer, batches):
+            pass  # L1 结果经队列给消费者, 不用返回值
+
+        # 聚合消费端结果 (阻塞等消费者跑完; 队列恒有 total 条, 自动停)
+        while n_done < len(tasks):
+            r = done_queue.get()
+            if r is not None:
+                results.append(r)
+                ok += 1
+            else:
+                fail += 1
+            n_done += 1
+            d = n_done
             if d % 5 == 0 or d == len(tasks):
                 el = time.time() - t0
                 rate = d / max(el, 1) * 60
-                print(f"  [{d}/{len(tasks)}] OK:{d} {rate:.1f}/min {el/60:.1f}min")
-    ok = len(results)
-    fail = len(tasks) - ok
+                print(f"  [{d}/{len(tasks)}] OK:{ok} FAIL:{fail} {rate:.1f}/min {el/60:.1f}min")
+            if not consumer.is_alive() and n_done < len(tasks):
+                print(f"\n  [消费者进程已退出, 未完成 {len(tasks)-n_done} 条] 提前终止")
+                break
+
+    consumer.join()
     with open(data / "dataset_index.json", "w") as f:
         json.dump(results, f, indent=2)
     el = time.time() - t0
@@ -615,4 +720,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # 无缓冲输出: 顶层 reconfigure, 子进程 spawn 重新 import 时继承无缓冲, 日志实时可见
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     main()

@@ -107,6 +107,12 @@ class RhoFoldEngine:
         sd = torch.load(str(_RHOFOLD_CKPT), map_location="cpu")
         self.model.load_state_dict(sd["model"])
         dev = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
+
+        # 混合精度: autocast 自动决定哪些层用 fp16 (embedding 保持 fp32, matmul 用 fp16)
+        self.use_fp16 = dev.type == "cuda"
+        if self.use_fp16 and verbose:
+            print(f"  [RhoFoldEngine] 混合精度模式 (autocast)")
+
         self.model = self.model.to(dev).eval()
         self.device = dev
         if verbose:
@@ -133,7 +139,8 @@ class RhoFoldEngine:
             print(f"    [{name}] RhoFold 模式: {mode}")
 
         fea = get_features(str(fa_path), msa_src)
-        with torch.no_grad():
+        # 混合精度: autocast 自动处理 dtype 转换 (整数保持 Long, 浮点转 fp16)
+        with torch.no_grad(), torch.amp.autocast("cuda", enabled=self.use_fp16):
             out = self.model(
                 tokens=fea["tokens"].to(self.device),
                 rna_fm_tokens=fea["rna_fm_tokens"].to(self.device),

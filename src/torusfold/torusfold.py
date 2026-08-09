@@ -507,6 +507,7 @@ class TorusFold(nn.Module):
         device: str = "cpu",
     ) -> Dict[str, float]:
         c = self.config
+        gene_expr = gene_expr or {}
         gene_values = [gene_expr.get(g, 0.5) for g in c.gene_cols]
         gene_tensor = torch.tensor([gene_values], dtype=torch.float32)
 

@@ -667,39 +667,46 @@ def main():
         print("all done!")
         return
 
-    # 流水线: 1 L1 GPU Worker (顺序 RhoFold) + 1 L2 CPU Consumer (OpenMM)
-    # 单 GPU 上顺序跑 RhoFold 最快, 不存在并行加速; 8 worker 只会争抢 GPU + 炸内存
+    # 流水线: N L1 GPU Workers (各自加载 RhoFold, 并行推理) + 1 L2 CPU Consumer (OpenMM)
     tasks = [(i, h, s) for i, (h, s) in enumerate(seqs)]
-    n_w = 1  # L1 GPU worker 固定 1 个 (单卡)
+    n_w = max(1, min(a.n_workers, len(tasks)))
 
     # Manager().Queue 走代理, 可跨进程 (Windows spawn) 共享
     manager = Manager()
-    queue = manager.Queue(maxsize=4)  # 小缓冲, L1 做完一条 L2 就取走
+    queue = manager.Queue(maxsize=max(2 * n_w, 8))
     done_queue = manager.Queue()
 
-    # L1 全部任务给一个 worker
-    all_tasks_args = (tasks, str(data), a.max_seg_len, a.overlap, a.rfam_dir, queue)
+    # 任务切分给 N 个 L1 worker
+    chunks = [[] for _ in range(n_w)]
+    for k, t in enumerate(tasks):
+        chunks[k % n_w].append(t)
 
-    est = len(tasks) * 20 / 60  # 单 GPU, 每样本 ~20s
-    print(f"\n>>> 流水线 1 L1-GPU-Worker x {len(tasks)} seqs (RhoFold+MSA 常驻引擎, L1.5+2 OpenMM CPU), ~{est:.0f} min\n")
+    est = len(tasks) * 15 / n_w / 60  # 每样本 ~15s (autocast), n_w 个 GPU 并行
+    print(f"\n>>> 流水线 {n_w} L1-GPU-Workers x {len(tasks)} seqs (RhoFold+MSA 混合精度, L1.5+2 OpenMM CPU), ~{est:.0f} min\n")
 
     from multiprocessing import Process
 
-    # L1 GPU Worker: 常驻 RhoFold 引擎, 顺序处理所有序列
-    producer = Process(
-        target=_l1_worker_producer,
-        args=(all_tasks_args,),
-        name="l1-gpu-producer",
-    )
+    # L1 GPU Workers: 每个独立加载 RhoFold 引擎, 处理自己的任务块
+    producers = []
+    for ci in range(n_w):
+        if not chunks[ci]:
+            continue
+        p = Process(
+            target=_l1_worker_producer,
+            args=((chunks[ci], str(data), a.max_seg_len, a.overlap, a.rfam_dir, queue),),
+            name=f"l1-gpu-{ci}",
+        )
+        producers.append(p)
 
-    # L2 CPU Consumer: 单进程 OpenMM 精修 (纯 CPU, 用户指定单线程)
+    # L2 CPU Consumer: 单进程 OpenMM 精修 (纯 CPU)
     consumer = Process(
         target=_l2_consumer,
         args=(queue, done_queue, len(tasks), a.n_anneal, str(data)),
         name="l2-cpu-consumer",
     )
 
-    producer.start()
+    for p in producers:
+        p.start()
     consumer.start()
 
     t0 = time.time()
@@ -725,7 +732,8 @@ def main():
             print(f"\n  [消费者进程已退出, 未完成 {len(tasks)-n_done} 条] 提前终止")
             break
 
-    producer.join()
+    for p in producers:
+        p.join()
     consumer.join()
     with open(data / "dataset_index.json", "w") as f:
         json.dump(results, f, indent=2)

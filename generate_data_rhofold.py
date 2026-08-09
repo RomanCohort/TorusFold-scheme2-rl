@@ -148,6 +148,12 @@ class RhoFoldEngine:
             )
         frames = out[-1]["frames"][0, 0].data.cpu().numpy()
         p_coords = frames[:, 4:7]
+
+        # 显式释放 GPU 中间 tensor (否则等 GC 回收, 4 worker 并发时显存累积)
+        del out, fea
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
         return np.asarray(p_coords, dtype=np.float64)
 
 

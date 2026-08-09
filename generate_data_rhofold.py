@@ -443,42 +443,38 @@ def _get_far_pairs(ss, gap=30):
     return [(i, j) for i, j in pairs if abs(j - i) > gap]
 
 
-# 流水线共享队列 (Pool worker 经 initializer 注入, 进程继承传递)
-_L1_QUEUE = None
-
-
-def _init_l1_worker(queue):
-    """Pool worker 初始化: 把队列注入全局 (Windows spawn 只能继承不能 pickle)."""
-    global _L1_QUEUE
-    _L1_QUEUE = queue
-
-
 def _l1_worker_producer(args):
     """Level 1 生产者: 常驻 RhoFold 引擎, 处理任务列表.
 
-    多进程并行 (每进程加载一次引擎), 把 Level 0 配对 + Level 1 坐标
-    塞进队列 (全局 _L1_QUEUE, 由 _init_l1_worker 注入), 由单线程 Level 2
-    消费者取走 (流水线重叠 GPU/CPU).
+    单进程顺序执行 (单 GPU 上顺序跑最快, 不存在并行加速).
+    每条序列做完 Level 0+1 后把结果塞队列, 由 L2 消费者取走.
 
     Args:
-        args: (tasks, work_root, max_seg_len, overlap, rfam_dir)
-
-    Returns:
-        None (结果通过 queue 给消费者; 失败塞 None 标记)
+        args: (tasks, work_root, max_seg_len, overlap, rfam_dir, queue)
     """
-    tasks, work_root, max_seg_len, overlap, rfam_dir = args
-    queue = _L1_QUEUE
-    if queue is None:
-        print("  [错误] worker 未初始化队列 (initializer 未注入)")
-        return
+    tasks, work_root, max_seg_len, overlap, rfam_dir, queue = args
     _ensure_src()
+
+    # 显式初始化 CUDA (Windows spawn 下可能未初始化)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            torch.cuda.set_device(0)
+            _ = torch.zeros(1).cuda()  # 触发 CUDA context 初始化
+            print(f"  [L1-GPU] CUDA 初始化成功: {torch.cuda.get_device_name(0)}")
+        else:
+            print("  [L1-GPU] CUDA 不可用, 回退 CPU 模式 (会很慢)")
+    except Exception as e:
+        print(f"  [L1-GPU] CUDA 初始化失败: {e}")
 
     # RhoFold 引擎加载一次, 整批序列复用
     engine = None
     try:
         engine = RhoFoldEngine(verbose=False)
+        print("  [L1-GPU] RhoFold 引擎加载成功")
     except Exception as e:
-        print(f"  [RhoFoldEngine] 加载失败: {e}, 回退子进程模式")
+        print(f"  [L1-GPU] RhoFold 引擎加载失败: {e}, 回退子进程模式")
         engine = None
 
     for (idx, header, seq) in tasks:
@@ -489,6 +485,14 @@ def _l1_worker_producer(args):
         except Exception as e:
             print(f"  [s{idx:05d}] Level1 生产者异常: {e}")
             queue.put(None)  # 失败标记, 保证队列恒有 total 条
+        finally:
+            # 每条序列后释放显存 (RhoFold 中间激活的 GPU 缓存)
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
 
 
 def _l1_produce_one(idx, header, seq, work_root,
@@ -656,62 +660,65 @@ def main():
         print("all done!")
         return
 
-    # 流水线: Level 1 生产者 (多进程, 常驻 RhoFold 引擎) -> Level 2 消费者 (单进程 OpenMM)
+    # 流水线: 1 L1 GPU Worker (顺序 RhoFold) + 1 L2 CPU Consumer (OpenMM)
+    # 单 GPU 上顺序跑 RhoFold 最快, 不存在并行加速; 8 worker 只会争抢 GPU + 炸内存
     tasks = [(i, h, s) for i, (h, s) in enumerate(seqs)]
-    n_w = max(1, min(a.n_workers, len(tasks)))
-    chunks = [[] for _ in range(n_w)]
-    for k, t in enumerate(tasks):
-        chunks[k % n_w].append(t)
+    n_w = 1  # L1 GPU worker 固定 1 个 (单卡)
 
-    # 队列: 任务队列 (L1 -> L2) + 完成队列 (L2 -> main 聚合进度)
-    # Manager().Queue 走代理, 可跨进程 (Windows spawn) 共享, 是 Pool 传 queue 的唯一正解
+    # Manager().Queue 走代理, 可跨进程 (Windows spawn) 共享
     manager = Manager()
-    queue = manager.Queue(maxsize=max(2 * n_w, 8))
+    queue = manager.Queue(maxsize=4)  # 小缓冲, L1 做完一条 L2 就取走
     done_queue = manager.Queue()
 
-    # 每个 worker 一份任务块 (queue 不进 task 参数, 经 initializer 进程继承传递)
-    batches = [(c, str(data), a.max_seg_len, a.overlap, a.rfam_dir)
-               for c in chunks if c]
+    # L1 全部任务给一个 worker
+    all_tasks_args = (tasks, str(data), a.max_seg_len, a.overlap, a.rfam_dir, queue)
 
-    # 估算: L1 GPU 是瓶颈. 每样本 5-20s, 多进程并行后吞吐 ~ n_w 样本/20s.
-    est = len(tasks) * 20 / n_w / 60
-    print(f"\n>>> 流水线 {n_w} L1-producers x {len(tasks)} seqs (RhoFold+MSA 常驻引擎, L1.5+2 OpenMM 单进程消费者), ~{est:.0f} min\n")
+    est = len(tasks) * 20 / 60  # 单 GPU, 每样本 ~20s
+    print(f"\n>>> 流水线 1 L1-GPU-Worker x {len(tasks)} seqs (RhoFold+MSA 常驻引擎, L1.5+2 OpenMM CPU), ~{est:.0f} min\n")
 
-    # L2 消费者: 单进程, 从队列取, OpenMM 精修
     from multiprocessing import Process
+
+    # L1 GPU Worker: 常驻 RhoFold 引擎, 顺序处理所有序列
+    producer = Process(
+        target=_l1_worker_producer,
+        args=(all_tasks_args,),
+        name="l1-gpu-producer",
+    )
+
+    # L2 CPU Consumer: 单进程 OpenMM 精修 (纯 CPU, 用户指定单线程)
     consumer = Process(
         target=_l2_consumer,
         args=(queue, done_queue, len(tasks), a.n_anneal, str(data)),
-        name="l2-consumer",
+        name="l2-cpu-consumer",
     )
+
+    producer.start()
     consumer.start()
 
     t0 = time.time()
     results = []
     ok = fail = 0
     n_done = 0
-    with Pool(n_w, initializer=_init_l1_worker, initargs=(queue,)) as pool:
-        for _ in pool.imap_unordered(_l1_worker_producer, batches):
-            pass  # L1 结果经队列给消费者, 不用返回值
 
-        # 聚合消费端结果 (阻塞等消费者跑完; 队列恒有 total 条, 自动停)
-        while n_done < len(tasks):
-            r = done_queue.get()
-            if r is not None:
-                results.append(r)
-                ok += 1
-            else:
-                fail += 1
-            n_done += 1
-            d = n_done
-            if d % 5 == 0 or d == len(tasks):
-                el = time.time() - t0
-                rate = d / max(el, 1) * 60
-                print(f"  [{d}/{len(tasks)}] OK:{ok} FAIL:{fail} {rate:.1f}/min {el/60:.1f}min")
-            if not consumer.is_alive() and n_done < len(tasks):
-                print(f"\n  [消费者进程已退出, 未完成 {len(tasks)-n_done} 条] 提前终止")
-                break
+    # 聚合消费端结果 (阻塞等消费者跑完; 队列恒有 total 条, 自动停)
+    while n_done < len(tasks):
+        r = done_queue.get()
+        if r is not None:
+            results.append(r)
+            ok += 1
+        else:
+            fail += 1
+        n_done += 1
+        d = n_done
+        if d % 5 == 0 or d == len(tasks):
+            el = time.time() - t0
+            rate = d / max(el, 1) * 60
+            print(f"  [{d}/{len(tasks)}] OK:{ok} FAIL:{fail} {rate:.1f}/min {el/60:.1f}min")
+        if not consumer.is_alive() and n_done < len(tasks):
+            print(f"\n  [消费者进程已退出, 未完成 {len(tasks)-n_done} 条] 提前终止")
+            break
 
+    producer.join()
     consumer.join()
     with open(data / "dataset_index.json", "w") as f:
         json.dump(results, f, indent=2)

@@ -2,7 +2,8 @@
 """generate_data_rhofold.py — 独立 circRNA 数据生成管线 (RhoFold+ MSA + OpenMM)
 
 Level 0: ViennaRNA 粗筛 (vienna_pair_probs) → 近程/远端配对
-Level 1: 分段 RhoFold+ MSA (segmented_vfold3d_pipeline, use_rhofold=True) → 拼装 P 坐标
+Level 1: 分段 RhoFold+ MSA (常驻引擎, 分项策略) → 拼装 P 坐标
+Level 1.5: OpenMM CG 弛豫 (平滑分段拼装边界) → 预热坐标
 Level 2: OpenMM 3-bead CG 退火 (BSJ 闭合 + 精修) → 精修 P 坐标
 输出: P 坐标 + 特征 (features), 与 generate_training_data.py 兼容
 
@@ -216,6 +217,81 @@ def level1_rhofold(seq, ss, out_dir, engine: Optional[RhoFoldEngine] = None,
 
 
 # ═══════════════════════════════════════════════════════════
+#  Level 1.5: CG 弛豫 (平滑分段拼装边界)
+# ═══════════════════════════════════════════════════════════
+def _openmm_cg_relax_pre(
+    p_coords: np.ndarray,
+    pairs: list,
+    n_threads: int = 1,
+    verbose: bool = False,
+) -> np.ndarray:
+    """Level 1.5: 短 MD CG 弛豫, 平滑分段拼装边界不连续.
+
+    镜像 prediction 管线 (isrnaclong.py) 的 Level 1.5 实现:
+    _build_3bead_system_gpu(pair_scale=0.5, bsj_k_scale=0.3) + 最小化 + 2000 step 短 MD.
+    主要消除分段拼装的接缝处坐标不连续, 为 Level 2 退火预热.
+
+    Args:
+        p_coords: (L,3) Level 1 拼装后的 P 坐标 (Å)
+        pairs: 配对列表 [(i,j,score)]
+
+    Returns:
+        (L,3) 弛豫后的 P 坐标 (Å), 失败时原样返回
+    """
+    import openmm as mm
+    from openmm import Platform as _Plat
+    from openmm import LangevinMiddleIntegrator as _LMI
+    from openmm.app import Simulation as _Sim
+    from torusfold.scheme2.openmm_gpu_refiner import (
+        _build_3bead_system_gpu, _create_3bead_topology,
+        _generate_compact_coords, _sanitize_p_coords,
+    )
+
+    L = len(p_coords)
+    if L < 3:
+        return p_coords
+
+    try:
+        relax_coords = _sanitize_p_coords(p_coords.copy())
+        # 只检查 P-P 键长异常才替换 (环状结构首末距天然可大, 用首末距会误判)
+        avg_pp = 0.0
+        if L > 1:
+            ppd = np.linalg.norm(np.diff(relax_coords, axis=0), axis=1)
+            avg_pp = float(np.mean(ppd[:min(L - 1, 500)]))
+        if (not np.isfinite(avg_pp)) or avg_pp > 20.0 or avg_pp < 1.0:
+            relax_coords = _generate_compact_coords(L, pairs)
+
+        system, coords_nm, pf, sf, bjf, bjg = _build_3bead_system_gpu(
+            relax_coords, pairs, pair_scale=0.5, bsj_k_scale=0.3)
+        topo = _create_3bead_topology(L)
+        integrator = _LMI(300 * mm.unit.kelvin, 1.0 / mm.unit.picosecond,
+                          0.002 * mm.unit.picosecond)
+        plat = _Plat.getPlatformByName("CPU")
+        sim = _Sim(topo, system, integrator, plat, {"CpuThreads": str(n_threads)})
+        sim.context.setPositions(coords_nm * mm.unit.nanometer)
+
+        sim.minimizeEnergy(
+            tolerance=100.0 * mm.unit.kilojoules_per_mole / mm.unit.nanometer,
+            maxIterations=1000)
+        sim.step(2000)  # 4ps 短 MD
+
+        state = sim.context.getState(getPositions=True, getEnergy=True)
+        e_relax = state.getPotentialEnergy()._value
+        pos = state.getPositions(asNumpy=True)._value  # nm
+        p_relaxed = np.asarray(pos[0::3]) * 10.0  # nm → Å, P beads
+
+        if len(p_relaxed) == L:
+            if verbose:
+                print(f"    L1.5 弛豫: E={e_relax:.0f} kJ/mol")
+            return p_relaxed
+        return p_coords
+    except Exception as e:
+        if verbose:
+            print(f"    L1.5 弛豫失败: {e}, 用原始坐标")
+        return p_coords
+
+
+# ═══════════════════════════════════════════════════════════
 #  Level 2: OpenMM 3-bead CG 退火 (close + 精修)
 # ═══════════════════════════════════════════════════════════
 def _openmm_cg_relax(
@@ -418,12 +494,21 @@ def _worker_batch(batch_args):
             results.append(None)
             continue
 
+        # 配对列表 (近程 + 远端), L1.5 和 L2 共用
+        all_pairs = pairs_near + [(int(i), int(j), 1.0) for (i, j) in fp]
+        seen = set()
+        all_pairs = [p for p in all_pairs
+                     if not (p[0], p[1]) in seen and not seen.add((p[0], p[1]))]
+
+        # Level 1.5: CG 弛豫 (平滑分段拼装边界, 为 Level 2 预热)
+        try:
+            coords_vfold = _openmm_cg_relax_pre(
+                coords_vfold, all_pairs, n_threads=1, verbose=False)
+        except Exception as e:
+            print(f"  [{name}] Level1.5 弛豫跳过: {e}")
+
         # Level 2: OpenMM close + 精修
         try:
-            all_pairs = pairs_near + [(int(i), int(j), 1.0) for (i, j) in fp]
-            seen = set()
-            all_pairs = [p for p in all_pairs
-                         if not (p[0], p[1]) in seen and not seen.add((p[0], p[1]))]
             coords_refined, energy = _openmm_cg_relax(
                 coords_vfold, all_pairs, n_anneal=n_anneal, n_threads=1)
         except Exception as e:

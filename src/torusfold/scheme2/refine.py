@@ -37,8 +37,11 @@ def _import_rna():
         ) from e
 
 
-def vienna_pair_probs(sequence: str, threshold: float = 0.3):
+def vienna_pair_probs(sequence: str, threshold: float = 0.3, circ: bool = True):
     """ViennaRNA 算配对概率矩阵 → 提取 (i,j) 配对约束。
+
+    circ=True (默认): ViennaRNA 环形模式 (VRNA_OPTION_CIRC), 正确处理环形 RNA
+    的头尾配对. 项目是 circRNA 管线, 默认环形. 显式传 circ=False 可切回线性.
 
     返回 (pairs, bpp): pairs=[(i,j,prob)] 为 0-indexed，bpp 为 0-indexed 的 L×L 概率矩阵。
 
@@ -46,7 +49,9 @@ def vienna_pair_probs(sequence: str, threshold: float = 0.3):
     这里切 [1:,1:] 转回 0-indexed 与下游 coords 对齐。
     """
     RNA = _import_rna()
-    fc = RNA.fold_compound(sequence)
+    md = RNA.md()
+    md.circ = 1 if circ else 0
+    fc = RNA.fold_compound(sequence, md)
     fc.pf()
     fc.mfe()
     bpp = np.array(fc.bpp())[1:, 1:]  # 1-indexed → 0-indexed

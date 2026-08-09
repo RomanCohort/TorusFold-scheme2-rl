@@ -36,7 +36,9 @@ W = 6                 # 滑窗长度
 WC_RATE = 0.80        # WC 配对率阈值
 DG_THRESHOLD = -3.0   # NN 自由能阈值 (kcal/mol, 粗参数表故放宽)
 MIN_STEM = 4          # 茎块最小连续配对数
+MIN_WC_IN_WIN = 4     # 方案 E: 扫描窗口内连续 WC 对数门槛 (6中≥4)
 FAR_DIST = 50         # 远端拓扑距离阈值
+MAX_KMER_FREQ = 20    # 方案 H: 单个 k-mer 出现 > 此值跳过 rc 匹配 (滤重复序列)
 
 # ---------- 简单 RNA nearest-neighbor 自由能参数 ----------
 # RNA NN model (SantaLucia 1998 近似值, kcal/mol at 37°C)
@@ -151,7 +153,11 @@ def complementarity_scan(
     dg_threshold: float = DG_THRESHOLD,
     min_gap: int = 10,
 ) -> List[Tuple[int, int, float]]:
-    """滑窗互补扫描, 补 ViennaRNA 漏掉的长程配对 (反向重复)。
+    """滑窗互补扫描 (方案 H: k-mer 索引, 从 O(L²) 降到 O(L×4^W))。
+
+    旧版 O(L²) 双循环在 L=3000 时 4.5M 次迭代, 纯 Python。
+    新版: 预索引所有窗口的 reverse_complement k-mer → 用 k-mer
+    反向查找候选 → 只在候选上验 dg, 复杂度 O(L×4^W)。
 
     Args:
         sequence: ACGU 字符串 (circRNA, 环形)
@@ -165,46 +171,67 @@ def complementarity_scan(
         i, j 是窗口起始 (0-based), 代表 seq[i:i+W] 与 seq[j:j+W] 反向平行互补。
     """
     L = len(sequence)
+    if L < window * 2 + min_gap:
+        return []
+
+    # 环形序列缓存 (窗口跨末尾时用)
+    seq_ext = sequence + sequence[:window - 1]
+
+    # 预索引: k-mer → [起始位置列表]
+    kmer_idx: Dict[str, List[int]] = {}
+    for i in range(L):
+        kmer = seq_ext[i:i + window]
+        if len(kmer) == window:
+            kmer_idx.setdefault(kmer, []).append(i)
+
+    # 反向映射: 对每个 k-mer, 找它的 reverse_complement
+    # 只匹配低频 k-mer (方案 H: 避免 poly-G 等重复序列互相爆炸匹配)
+    rc_map: Dict[str, str] = {}
+    for kmer, positions in kmer_idx.items():
+        if len(positions) > MAX_KMER_FREQ:
+            continue
+        rc = _reverse_complement(kmer)
+        if rc in kmer_idx and kmer != rc and len(kmer_idx[rc]) <= MAX_KMER_FREQ:
+            rc_map[kmer] = rc
+
     pairs: List[Tuple[int, int, float]] = []
     seen: Set[Tuple[int, int]] = set()
 
-    for i in range(L):
-        win_a = sequence[i:i + window]
-        if len(win_a) < window:
-            # circRNA 环形: 窗口跨末尾
-            win_a = (sequence + sequence[:window - 1])[i:i + window]
-        for j in range(i + min_gap, L):
-            # 环距 = min(|i-j|, L-|i-j|), 跨 BSJ 也算近, 跳过
-            ring_dist = min(abs(i - j), L - abs(i - j))
-            if ring_dist < min_gap:
-                continue
-            win_b = sequence[j:j + window]
-            if len(win_b) < window:
-                win_b = (sequence + sequence[:window - 1])[j:j + window]
-
-            # WC 配对率
-            wc = _wc_count(win_a, win_b)
-            if wc / window < wc_rate:
-                continue
-            # 允许 G·U wobble: 剩余必须全部互补 (不能有错配)
-            all_comp = all(
-                _is_complementary(win_a[k], win_b[window - 1 - k])
-                for k in range(window)
-            )
-            if not all_comp:
-                continue
-            # 能量过滤
-            dg = _nn_free_energy(win_a, win_b)
-            if dg >= dg_threshold:
-                continue
-
-            key = (min(i, j), max(i, j))
-            if key in seen:
-                continue
-            seen.add(key)
-            pairs.append((i, j, dg))
+    for kmer_a, positions in kmer_idx.items():
+        kmer_b_rc = rc_map.get(kmer_a)
+        if kmer_b_rc is None:
+            continue
+        positions_b = kmer_idx[kmer_b_rc]
+        for i in positions:
+            for j in positions_b:
+                ring_dist = min(abs(i - j), L - abs(i - j))
+                if ring_dist < min_gap:
+                    continue
+                key = (min(i, j), max(i, j))
+                if key in seen:
+                    continue
+                seen.add(key)
+                # 反向平行: win_b = seq[j:j+W] 配 win_a 的反向
+                win_a = seq_ext[i:i + window]
+                win_b = seq_ext[j:j + window]
+                # 全匹配验证 (k-mer RC 已保证全 WC, 但需确认反向平行)
+                wc = _wc_count(win_a, win_b)
+                if wc / window < wc_rate:
+                    continue
+                # 能量过滤
+                dg = _nn_free_energy(win_a, win_b)
+                if dg >= dg_threshold:
+                    continue
+                pairs.append((i, j, dg))
 
     return pairs
+
+
+def _reverse_complement(seq: str) -> str:
+    """返回 seq 的反向互补 (ACGU)。"""
+    comp = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G',
+            'U': 'A', 'A': 'U', 'N': 'N'}
+    return "".join(comp.get(b, 'N') for b in reversed(seq))
 
 
 # ---------- 配对图构建 ----------
@@ -237,10 +264,19 @@ def build_pair_graph(
             adj[j].append(i)
 
     # 互补扫描补充 (扫描返回窗口起始, 展开成逐残基配对)
+    # 方案 E: 质量门控 — 只在连续窗口内 ≥4/6 是 WC 对才展开
     if scan_pairs:
         for (i0, j0, _dg) in scan_pairs:
-            # win_a = seq[i0:i0+W], win_b = seq[j0:j0+W]
-            # 反向平行: win_a[k] 配 win_b[W-1-k]
+            # 高质量门: 要求 ≥ MIN_WC_IN_WIN 个连续 WC 对才算真远端茎
+            seq = sequence
+            win_a = seq[i0:i0 + W] if len(seq[i0:i0 + W]) == W else (seq + seq[:W - 1])[i0:i0 + W]
+            win_b = seq[j0:j0 + W] if len(seq[j0:j0 + W]) == W else (seq + seq[:W - 1])[j0:j0 + W]
+            wc_hits = sum(
+                _is_complementary(win_a[k], win_b[W - 1 - k])
+                for k in range(W)
+            )
+            if wc_hits < MIN_WC_IN_WIN:
+                continue
             for k in range(W):
                 ik = (i0 + k) % L
                 jk = (j0 + W - 1 - k) % L

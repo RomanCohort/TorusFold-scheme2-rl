@@ -20,9 +20,33 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-# ── 物理管线（scheme2） ──
+# ── 物理管线（scheme2 快速版 + isrnaclong 高精度） ──
 from .scheme2 import predict_3d_allatom
 from .scheme2.refine import vienna_pair_probs, BOND_LEN
+
+# 默认 checkpoint 搜索路径（S10 final，训练完成后放这里）
+_DEFAULT_DL_CKPT = Path(__file__).resolve().parent.parent.parent / "models" / "s10_final.pt"
+
+# 默认临时输出目录（isrnaclong 需要 output_dir，用系统临时目录）
+_DEFAULT_PHYSICS_DIR = Path(__file__).resolve().parent.parent.parent / "output_physics"
+
+
+def pairs_to_dotbracket(pairs, length):
+    """从配对列表生成 dot-bracket3 二级结构字符串。
+
+    Args:
+        pairs: [(i, j, weight), ...] 0-based 配对列表
+        length: 序列长度
+
+    Returns:
+        dot-bracket3 字符串 (e.g. "...(((..))).")
+    """
+    db = list("." * length)
+    for (i, j, _w) in pairs:
+        if 0 <= i < length and 0 <= j < length:
+            db[i] = "("
+            db[j] = ")"
+    return "".join(db)
 
 # 默认 checkpoint 搜索路径（S10 final，训练完成后放这里）
 _DEFAULT_DL_CKPT = Path(__file__).resolve().parent.parent.parent / "models" / "s10_final.pt"
@@ -103,6 +127,91 @@ def _dl_cg_signals(
     return signals
 
 
+def _predict_physics_high(
+    seq: str,
+    *,
+    pair_threshold: float = 0.5,
+    use_rl: bool = False,
+    output_dir: Optional[str] = None,
+    n_relax_rounds: int = 10,
+    n_rest2_replicas: int = 8,
+    md_step_scale: float = 0.1,
+    resume: bool = True,
+    device: str = "cpu",
+    **kwargs,
+) -> Dict[str, object]:
+    """高精度物理管线（Level 0-5, isrnaclong_pipeline）。
+
+    封装 isrnaclong_pipeline 到 predict_structure 统一输出格式。
+    secondary_structure 从 ViennaRNA 配对自动转 dot-bracket。
+    output_dir 不传则用临时目录（每次运行独立，不支持 checkpoint 恢复）。
+    """
+    import tempfile
+    import time
+
+    # Level 0: ViennaRNA 配对
+    pairs, bpp = vienna_pair_probs(seq, pair_threshold)
+    secondary_structure = pairs_to_dotbracket(pairs, len(seq))
+
+    # 输出目录
+    if output_dir is None:
+        tmp_dir = tempfile.mkdtemp(prefix="torusfold_physics_")
+        output_dir = tmp_dir
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # 调用 isrnaclong Pipeline（Level 0-5）
+    from .scheme2.isrnaclong import isrnaclong_pipeline
+
+    t0 = time.time()
+    try:
+        result = isrnaclong_pipeline(
+            seq,
+            secondary_structure,
+            output_dir,
+            n_relax_rounds=n_relax_rounds,
+            n_rest2_replicas=n_rest2_replicas,
+            md_step_scale=md_step_scale,
+            use_rl_relax=use_rl,
+            use_rl_mcts=use_rl,
+            resume=resume,
+            verbose=True,
+        )
+        dt = time.time() - t0
+
+        # LongPipelineResult → 统一输出
+        return {
+            "ok": True, "mode": "physics", "engine": "physics",
+            "available": True,
+            "sequence": seq,
+            "secondary_structure": secondary_structure,
+            "coords_cg": result.coords_cg,
+            "coords_aa": result.coords_aa,
+            "pairs": pairs,
+            "pair_probs": bpp,
+            "pair_rate": result.pair_rate,
+            "cross_segment_ok_rate": result.cross_segment_ok_rate,
+            "energy_cg": result.energy_cg,
+            "energy_aa": result.energy_aa,
+            "n_segments": result.n_segments,
+            "runtime_seconds": dt,
+            "fidelity_history": result.fidelity_history,
+            "output_dir": output_dir,
+            "structure_method": "isrnaclong_level5",
+            "reason": "ok",
+        }
+    except Exception as e:
+        dt = time.time() - t0
+        return {
+            "ok": False, "mode": "physics", "engine": "physics",
+            "available": False, "reason": "isrnaclong_error",
+            "sequence": seq, "secondary_structure": secondary_structure,
+            "error": str(e)[:500],
+            "runtime_seconds": dt,
+            "output_dir": output_dir,
+            "pairs": pairs, "pair_probs": bpp,
+        }
+
+
 def predict_structure(
     sequence: str,
     *,
@@ -112,25 +221,37 @@ def predict_structure(
     pair_threshold: float = 0.5,
     use_rl: bool = False,
     use_relaxation: bool = True,
+    output_dir: Optional[str] = None,
+    n_relax_rounds: int = 10,
+    n_rest2_replicas: int = 8,
+    md_step_scale: float = 0.1,
+    resume: bool = True,
     **kwargs,
 ) -> Dict[str, object]:
     """TorusFold 推理统一入口。
 
     Args:
         sequence: circRNA 序列 (ACGU)
-        mode: "physics" 物理管线 | "dl" DL 主模型
+        mode:
+          - "physics":      高精度物理管线（Level 0-5, isrnaclong, 慢但准）
+          - "physics_fast": 精简物理管线（predict_3d_allatom, 快但略粗）
+          - "dl":           DL 主模型（等变 GNN, CG only）
         checkpoint: DL 主模型权重路径（dl 模式用）
         device: 计算设备
         pair_threshold: ViennaRNA 配对阈值
-        use_rl: 物理版是否启用 RL 远端配对优化
-        use_relaxation: 物理版是否启用 OpenMM 弛豫后处理
+        use_rl: 物理版是否启用 RL（physics: use_rl_mcts; physics_fast: RL 远端优化）
+        use_relaxation: 物理版是否启用弛豫后处理
+        output_dir: isrnaclong 输出目录（默认临时目录）
+        n_relax_rounds: Level 2 迭代弛豫轮数（physics 模式）
+        n_rest2_replicas: Level 4 REST2 副本数（physics 模式）
+        md_step_scale: Level 2 MD 步数缩放因子（physics 模式）
+        resume: 是否断点续跑（physics 模式 checkpoint）
 
     Returns:
         dict:
-          physics: predict_3d_allatom 原样输出 + {mode, engine="physics"}
-          dl:      {mode, engine="dl", coords_cg, pairs, pair_probs,
-                    structure_signals, available, reason, ...}
-          两模式顶层键对齐：mode / available / coords_cg / pairs / pair_probs
+          三模式共用键：mode / engine / available / ok
+          physics/physics_fast 额外有：coords_cg / coords_aa / pairs / pair_probs
+          dl 额外有：coords_cg / pairs / pair_probs / structure_signals
     """
     seq = str(sequence).strip().upper()
     if not seq or not all(c in "ACGU" for c in seq):
@@ -138,6 +259,13 @@ def predict_structure(
                 "reason": "invalid_sequence", "error": "sequence 只能包含 A/C/G/U"}
 
     if mode == "physics":
+        return _predict_physics_high(
+            seq, pair_threshold=pair_threshold, use_rl=use_rl,
+            output_dir=output_dir, n_relax_rounds=n_relax_rounds,
+            n_rest2_replicas=n_rest2_replicas, md_step_scale=md_step_scale,
+            resume=resume, device=device, **kwargs)
+
+    elif mode == "physics_fast":
         res = predict_3d_allatom(
             seq,
             pair_threshold=pair_threshold,
@@ -146,8 +274,8 @@ def predict_structure(
             **kwargs,
         )
         # 顶层对齐：确保有 mode / available
-        res["mode"] = "physics"
-        res["engine"] = "physics"
+        res["mode"] = "physics_fast"
+        res["engine"] = "physics_fast"
         res["ok"] = bool(res.get("available", True))
         return res
 
@@ -208,7 +336,11 @@ def predict_structure(
     else:
         return {"ok": False, "mode": mode, "available": False,
                 "reason": "unknown_mode",
-                "error": f"mode 必须是 physics|dl，收到 {mode!r}"}
+                "error": f"mode 必须是 physics|physics_fast|dl，收到 {mode!r}"}
 
 
-__all__ = ["predict_structure", "build_torusfold_model"]
+__all__ = [
+    "predict_structure",
+    "build_torusfold_model",
+    "pairs_to_dotbracket",
+]

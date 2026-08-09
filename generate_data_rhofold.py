@@ -162,16 +162,10 @@ class RhoFoldEngine:
         frames = out[-1]["frames"][0, 0].data.cpu().numpy()
         p_coords = frames[:, 4:7]
 
-        # 激进释放 GPU 显存:
-        # 1. del out, fea — 解除 Python 引用
-        # 2. gc.collect() — 强制回收循环引用
-        # 3. synchronize() — 等待 GPU 操作完成
-        # 4. empty_cache() — 释放 PyTorch 缓存给 OS
+        # 释放 GPU 显存: del 解除引用 + empty_cache 释放缓存给 OS
+        # (不用 synchronize/gc.collect，那会阻塞吞吐量)
         del out, fea
         if self.device.type == "cuda":
-            import gc
-            gc.collect()
-            torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
         if self.verbose:
@@ -522,12 +516,10 @@ def _l1_worker_producer(args):
             print(f"  [s{idx:05d}] Level1 生产者异常: {e}")
             queue.put(None)  # 失败标记, 保证队列恒有 total 条
         finally:
-            # 每条序列后强制释放显存 (防止累积)
+            # 每条序列后释放显存缓存 (轻量, 不阻塞)
             try:
-                import torch, gc
+                import torch
                 if torch.cuda.is_available():
-                    gc.collect()
-                    torch.cuda.synchronize()
                     torch.cuda.empty_cache()
             except Exception:
                 pass

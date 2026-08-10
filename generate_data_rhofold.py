@@ -640,6 +640,12 @@ def _l2_process_one(job, n_anneal, work_root):
     np.save(str(wdir / f"{name}_p.npy"), coords_refined)
     np.save(str(wdir / f"{name}_rhofold_p.npy"), coords_vfold)
 
+    # 清理中间文件: l1_rhofold/ 里的 .fa 文件只在推理时需要, 完成后无用
+    import shutil
+    l1_dir = wdir / "l1_rhofold"
+    if l1_dir.exists():
+        shutil.rmtree(l1_dir, ignore_errors=True)
+
     return {
         "header": header, "seq": seq, "ss": ss,
         "far_pairs": fp, "features": feat.tolist(),

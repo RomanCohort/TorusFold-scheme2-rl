@@ -691,13 +691,21 @@ def main():
     if a.resume:
         done = {d.name for d in data.iterdir() if (d / f"{d.name}_p.npy").exists()}
         seqs = [(h, s) for i, (h, s) in enumerate(seqs) if f"s{i:05d}" not in done]
-        print(f"  remaining: {len(seqs)}")
+        # 找到最大已有编号, 后续新样本从 max_idx+1 开始编号
+        max_idx = -1
+        for d in done:
+            if d.startswith("s") and d[1:].isdigit():
+                max_idx = max(max_idx, int(d[1:]))
+        _next_idx = max_idx + 1
+        print(f"  remaining: {len(seqs)} (next_idx: s{_next_idx:05d})")
+    else:
+        _next_idx = 0
     if not seqs:
         print("all done!")
         return
 
     # 流水线: N L1 GPU Workers (各自加载 RhoFold, 并行推理) + 1 L2 CPU Consumer (OpenMM)
-    tasks = [(i, h, s) for i, (h, s) in enumerate(seqs)]
+    tasks = [(_next_idx + i, h, s) for i, (h, s) in enumerate(seqs)]
     n_w = max(1, min(a.n_workers, len(tasks)))
 
     # Manager().Queue 走代理, 可跨进程 (Windows spawn) 共享

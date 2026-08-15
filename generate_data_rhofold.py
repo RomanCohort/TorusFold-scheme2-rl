@@ -753,7 +753,20 @@ def main():
 
     # 聚合消费端结果 (阻塞等消费者跑完; 队列恒有 total 条, 自动停)
     while n_done < len(tasks):
-        r = done_queue.get()
+        try:
+            r = done_queue.get(timeout=30)
+        except Exception:
+            # 队列通信断裂 (子进程崩溃) 或超时 (卡住)
+            if not consumer.is_alive():
+                print(f"\n  [消费者进程已退出, 未完成 {len(tasks)-n_done} 条] 提前终止")
+                break
+            # 检查生产者是否还活着
+            alive_producers = [p for p in producers if p.is_alive()]
+            if not alive_producers:
+                print(f"\n  [所有生产者已退出, 未完成 {len(tasks)-n_done} 条] 提前终止")
+                break
+            # 可能只是卡住了，继续等
+            continue
         if r is not None:
             results.append(r)
             ok += 1

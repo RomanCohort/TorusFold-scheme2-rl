@@ -93,8 +93,13 @@ def get_process_list():
         return 0
 
 
+# 全局变量: 保持子进程的 log 文件句柄打开
+_log_file = None
+
+
 def start_process():
     """启动数据生成进程 (用 comfyui 环境)."""
+    global _log_file
     env = os.environ.copy()
     env["CIRCBASE_FASTA"] = "C:/Users/颜子壹/Documents/circbase_seqs.fa.gz"
     env["DATA_OUT"] = "C:/tmp/test_isrna/rhofold_data"
@@ -103,10 +108,15 @@ def start_process():
            "--n-workers", "4", "--n-samples", "113539",
            "--max-len", "2000", "--min-len", "50",
            "--n-anneal", "300", "--resume"]
-    log_file = open(LOG_FILE, "a", buffering=1)
+    if _log_file:
+        try:
+            _log_file.close()
+        except Exception:
+            pass
+    _log_file = open(LOG_FILE, "a", buffering=1)
     proc = subprocess.Popen(
         cmd, cwd=str(ROOT), env=env,
-        stdout=log_file, stderr=subprocess.STDOUT,
+        stdout=_log_file, stderr=subprocess.STDOUT,
     )
     return proc.pid
 

@@ -20,10 +20,6 @@ PYTHON = "C:/ana/envs/comfyui/python.exe"
 SCRIPT = "generate_data_rhofold.py"
 DATA_DIR = Path("C:/tmp/test_isrna/rhofold_data/rhofold_data")
 
-# 环境变量
-ENV = os.environ.copy()
-ENV["CIRCBASE_FASTA"] = "C:/Users/颜子壹/Documents/circbase_seqs.fa.gz"
-ENV["DATA_OUT"] = "C:/tmp/test_isrna/rhofold_data"
 
 
 def count_products():
@@ -56,11 +52,13 @@ def start_process():
            "--min-len", "50",
            "--n-anneal", "300",
            "--resume"]
+    env = os.environ.copy()
+    env["CIRCBASE_FASTA"] = "C:/Users/颜子壹/Documents/circbase_seqs.fa.gz"
+    env["DATA_OUT"] = "C:/tmp/test_isrna/rhofold_data"
     with open(LOG_FILE, "a") as f:
         proc = subprocess.Popen(
-            cmd, cwd=str(ROOT), env=ENV,
+            cmd, cwd=str(ROOT), env=env,
             stdout=f, stderr=subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
         )
     return proc.pid
 

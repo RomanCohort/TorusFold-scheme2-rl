@@ -103,11 +103,11 @@ def start_process():
            "--n-workers", "4", "--n-samples", "113539",
            "--max-len", "2000", "--min-len", "50",
            "--n-anneal", "300", "--resume"]
-    with open(LOG_FILE, "a", buffering=1) as f:
-        proc = subprocess.Popen(
-            cmd, cwd=str(ROOT), env=env,
-            stdout=f, stderr=subprocess.STDOUT,
-        )
+    log_file = open(LOG_FILE, "a", buffering=1)
+    proc = subprocess.Popen(
+        cmd, cwd=str(ROOT), env=env,
+        stdout=log_file, stderr=subprocess.STDOUT,
+    )
     return proc.pid
 
 

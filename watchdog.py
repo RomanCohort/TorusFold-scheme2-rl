@@ -93,14 +93,20 @@ def get_process_list():
         return 0
 
 
-BAT_FILE = ROOT / "start_generate.bat"
-
-
 def start_process():
-    """启动数据生成进程 (用 .bat 文件, 跟双击运行一样)."""
+    """启动数据生成进程 (用 comfyui 环境)."""
+    env = os.environ.copy()
+    env["CIRCBASE_FASTA"] = "C:/Users/颜子壹/Documents/circbase_seqs.fa.gz"
+    env["DATA_OUT"] = "C:/tmp/test_isrna/rhofold_data"
+    env["PATH"] = r"C:\ana\envs\comfyui;" + env.get("PATH", "")
+    cmd = [r"C:\ana\envs\comfyui\python.exe", "-u", SCRIPT,
+           "--n-workers", "4", "--n-samples", "113539",
+           "--max-len", "2000", "--min-len", "50",
+           "--n-anneal", "300", "--resume"]
     with open(LOG_FILE, "a", buffering=1) as f:
         proc = subprocess.Popen(
-            str(BAT_FILE), shell=True, stdout=f, stderr=subprocess.STDOUT,
+            cmd, cwd=str(ROOT), env=env,
+            stdout=f, stderr=subprocess.STDOUT,
         )
     return proc.pid
 

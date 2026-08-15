@@ -147,10 +147,13 @@ def main():
     restart_count = 0
     last_count = count_products()
     last_change_time = time.time()
+    process_start_time = time.time()
+    grace_period = 600  # 启动后 10 分钟不检查卡住 (RhoFold 加载需要时间)
 
     print(f"[watchdog] 启动监控")
     print(f"  检查间隔: {args.check_interval}s")
     print(f"  卡住阈值: {args.stall_threshold}s")
+    print(f"  启动宽限: {grace_period}s")
     print(f"  最大重启: {args.max_restarts or '无限'}")
     print(f"  初始产物数: {last_count}")
 
@@ -158,6 +161,7 @@ def main():
     if get_process_list() == 0:
         pid = start_process()
         print(f"  启动进程: PID {pid}")
+        process_start_time = time.time()
         time.sleep(30)  # 等进程初始化
 
     while True:
@@ -178,8 +182,12 @@ def main():
         else:
             stall_secs = now - last_change_time
 
+        # 启动宽限期内不判定为卡住
+        elapsed = now - process_start_time
+        in_grace = elapsed < grace_period
+
         status = "RUNNING" if n_procs > 0 else "STOPPED"
-        if stall_secs > args.stall_threshold:
+        if not in_grace and stall_secs > args.stall_threshold:
             status = "STALLED"
 
         print(f"[{time.strftime('%H:%M:%S')}] {status} | "
@@ -199,6 +207,7 @@ def main():
             pid = start_process()
             restart_count += 1
             last_change_time = time.time()
+            process_start_time = time.time()  # 重置宽限期
             print(f"[watchdog] 新进程 PID: {pid}")
             time.sleep(30)  # 等进程初始化
 

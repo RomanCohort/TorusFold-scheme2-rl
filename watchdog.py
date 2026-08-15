@@ -19,7 +19,7 @@ LOG_FILE = Path("C:/tmp/test_isrna/generate.log")
 PYTHON = "C:/ana/envs/comfyui/python.exe"
 SCRIPT = "generate_data_rhofold.py"
 DATA_DIR = Path("C:/tmp/test_isrna/rhofold_data/rhofold_data")
-
+DISK_LOW_GB = 10  # 磁盘低于此值 (GB) 时清理
 
 
 def count_products():
@@ -28,6 +28,56 @@ def count_products():
         return 0
     return len([d for d in DATA_DIR.iterdir() if d.is_dir() and d.name.startswith("s") and
                 (d / f"{d.name}_p.npy").exists()])
+
+
+def get_disk_free_gb(drive="C"):
+    """获取磁盘剩余空间 (GB)."""
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(f"{drive}:/")
+        return free / (1024**3)
+    except Exception:
+        return 999
+
+
+def cleanup_temp():
+    """清理临时文件释放空间."""
+    cleaned = 0
+    # 清理 l1_rhofold 缓存 (每个 ~24KB, 上万个)
+    try:
+        for d in DATA_DIR.iterdir():
+            l1 = d / "l1_rhofold"
+            if l1.exists():
+                import shutil
+                shutil.rmtree(l1, ignore_errors=True)
+                cleaned += 1
+    except Exception:
+        pass
+    # 清理旧的 isrna_verify/test 目录
+    tmp_root = Path("C:/tmp")
+    for d in tmp_root.iterdir():
+        if d.is_dir() and d.name.startswith("isrna_") and d.name not in (
+            "rhofold_data", "rhofold_split", "rhofold_1w", "rhofold_4w",
+            "rhofold_8w", "rhofold_long", "isrna_bin"):
+            try:
+                import shutil
+                shutil.rmtree(d, ignore_errors=True)
+                cleaned += 1
+            except Exception:
+                pass
+    return cleaned
+
+
+def check_and_cleanup_disk():
+    """检查磁盘空间, 低于阈值则清理."""
+    free_gb = get_disk_free_gb()
+    if free_gb < DISK_LOW_GB:
+        print(f"  [磁盘] {free_gb:.1f}GB < {DISK_LOW_GB}GB, 清理中...")
+        n = cleanup_temp()
+        free_after = get_disk_free_gb()
+        print(f"  [磁盘] 清理了 {n} 个目录, 剩余 {free_after:.1f}GB")
+        return free_after
+    return free_gb
 
 
 def get_process_list():
@@ -117,6 +167,9 @@ def main():
         n_procs = get_process_list()
         now = time.time()
 
+        # 检查磁盘空间 (每轮都检查)
+        free_gb = check_and_cleanup_disk()
+
         # 检查产物是否增长
         if current_count > last_count:
             last_count = current_count
@@ -131,7 +184,7 @@ def main():
 
         print(f"[{time.strftime('%H:%M:%S')}] {status} | "
               f"products: {current_count} | processes: {n_procs} | "
-              f"stall: {stall_secs:.0f}s | restarts: {restart_count}")
+              f"disk: {free_gb:.0f}GB | stall: {stall_secs:.0f}s | restarts: {restart_count}")
 
         # 如果停止或卡住，重启
         if status in ("STOPPED", "STALLED"):

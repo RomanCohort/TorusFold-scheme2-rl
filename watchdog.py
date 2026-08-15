@@ -81,14 +81,26 @@ def check_and_cleanup_disk():
 
 
 def get_process_list():
-    """获取当前运行的 Python 进程."""
+    """获取当前运行的 Python 进程 (排除 watchdog 自己)."""
+    my_pid = os.getpid()
     try:
         r = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq python.exe"],
             capture_output=True, text=True, timeout=10
         )
         lines = [l for l in r.stdout.split("\n") if "python.exe" in l.lower()]
-        return len(lines)
+        # 排除 watchdog 自己
+        count = 0
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[1])
+                    if pid != my_pid:
+                        count += 1
+                except ValueError:
+                    pass
+        return count
     except Exception:
         return 0
 

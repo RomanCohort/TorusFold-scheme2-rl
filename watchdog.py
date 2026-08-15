@@ -80,23 +80,27 @@ def check_and_cleanup_disk():
     return free_gb
 
 
+# 排除列表: watchdog 自己 + 外部 Python 进程 (如 comfyui 服务)
+EXCLUDE_PIDS = set()
+
+
 def get_process_list():
-    """获取当前运行的 Python 进程 (排除 watchdog 自己)."""
+    """获取当前运行的 Python 进程 (排除 watchdog 自己 + 排除列表)."""
     my_pid = os.getpid()
+    exclude = EXCLUDE_PIDS | {my_pid}
     try:
         r = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq python.exe"],
             capture_output=True, text=True, timeout=10
         )
         lines = [l for l in r.stdout.split("\n") if "python.exe" in l.lower()]
-        # 排除 watchdog 自己
         count = 0
         for line in lines:
             parts = line.split()
             if len(parts) >= 2:
                 try:
                     pid = int(parts[1])
-                    if pid != my_pid:
+                    if pid not in exclude:
                         count += 1
                 except ValueError:
                     pass
@@ -160,6 +164,7 @@ def kill_process():
 
 
 def main():
+    global EXCLUDE_PIDS
     pa = argparse.ArgumentParser()
     pa.add_argument("--check-interval", type=int, default=60,
                     help="检查间隔 (秒)")
@@ -167,7 +172,16 @@ def main():
                     help="产物数不增长超过此秒数视为卡住")
     pa.add_argument("--max-restarts", type=int, default=10,
                     help="最大重启次数 (0=无限)")
+    pa.add_argument("--exclude-pids", type=str, default="",
+                    help="排除的 PID 列表 (逗号分隔)")
     args = pa.parse_args()
+
+    # 初始化排除列表
+    if args.exclude_pids:
+        for pid_str in args.exclude_pids.split(","):
+            pid_str = pid_str.strip()
+            if pid_str.isdigit():
+                EXCLUDE_PIDS.add(int(pid_str))
 
     restart_count = 0
     last_count = count_products()

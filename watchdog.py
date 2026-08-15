@@ -93,17 +93,14 @@ def get_process_list():
         return 0
 
 
+BAT_FILE = ROOT / "start_generate.bat"
+
+
 def start_process():
-    """启动数据生成进程 (用 shell=True, 跟手动启动一样)."""
-    cmd = (f'cd "{ROOT}" && '
-           f'CIRCBASE_FASTA="C:/Users/颜子壹/Documents/circbase_seqs.fa.gz" '
-           f'DATA_OUT="C:/tmp/test_isrna/rhofold_data" '
-           f'{PYTHON} -u {SCRIPT} '
-           f'--n-workers 4 --n-samples 113539 --max-len 2000 --min-len 50 '
-           f'--n-anneal 300 --resume')
-    with open(LOG_FILE, "a") as f:
+    """启动数据生成进程 (用 .bat 文件, 跟双击运行一样)."""
+    with open(LOG_FILE, "a", buffering=1) as f:
         proc = subprocess.Popen(
-            cmd, shell=True, stdout=f, stderr=subprocess.STDOUT,
+            str(BAT_FILE), shell=True, stdout=f, stderr=subprocess.STDOUT,
         )
     return proc.pid
 

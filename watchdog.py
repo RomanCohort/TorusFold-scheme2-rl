@@ -44,21 +44,16 @@ def get_process_list():
 
 
 def start_process():
-    """启动数据生成进程."""
-    cmd = [PYTHON, "-u", SCRIPT,
-           "--n-workers", "4",
-           "--n-samples", "113539",
-           "--max-len", "2000",
-           "--min-len", "50",
-           "--n-anneal", "300",
-           "--resume"]
-    env = os.environ.copy()
-    env["CIRCBASE_FASTA"] = "C:/Users/颜子壹/Documents/circbase_seqs.fa.gz"
-    env["DATA_OUT"] = "C:/tmp/test_isrna/rhofold_data"
+    """启动数据生成进程 (用 shell=True, 跟手动启动一样)."""
+    cmd = (f'cd "{ROOT}" && '
+           f'CIRCBASE_FASTA="C:/Users/颜子壹/Documents/circbase_seqs.fa.gz" '
+           f'DATA_OUT="C:/tmp/test_isrna/rhofold_data" '
+           f'{PYTHON} -u {SCRIPT} '
+           f'--n-workers 4 --n-samples 113539 --max-len 2000 --min-len 50 '
+           f'--n-anneal 300 --resume')
     with open(LOG_FILE, "a") as f:
         proc = subprocess.Popen(
-            cmd, cwd=str(ROOT), env=env,
-            stdout=f, stderr=subprocess.STDOUT,
+            cmd, shell=True, stdout=f, stderr=subprocess.STDOUT,
         )
     return proc.pid
 

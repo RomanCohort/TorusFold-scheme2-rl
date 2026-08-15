@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 from typing import Dict, Optional
 
+import numpy as np
 from pydantic import BaseModel, field_validator
 
 from .config import ServerConfig
@@ -45,6 +46,15 @@ _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 class PredictRequest(BaseModel):
     sequence: str
+    # RhoFoldCircLong 参数
+    max_seg_len: int = 200
+    overlap: int = 20
+    n_relax_rounds: int = 1
+    n_rest2_replicas: int = 4
+    rest2_nsteps: int = 50000
+    use_rl_mcts: bool = True
+    use_rhofold: bool = True
+    backend: str = "rhofoldcirclong"
 
     @field_validator("sequence")
     @classmethod
@@ -185,6 +195,76 @@ def create_app(config: Optional[ServerConfig] = None) -> "FastAPI":
         predictor: TorusFoldPredictor = app.state.predictor
         return predictor.health
 
+    @app.get("/api/view")
+    def view_pdb(path: str) -> Response:
+        """直接加载本地 PDB 文件显示."""
+        from fastapi import Query
+        import os
+        pdb_path = Path(path)
+        if not pdb_path.exists():
+            raise HTTPException(status_code=404, detail=f"PDB not found: {path}")
+        pdb_text = pdb_path.read_text(encoding="utf-8")
+        return Response(
+            pdb_text,
+            media_type="chemical/x-pdb",
+            headers={"Content-Disposition": f'attachment; filename="{pdb_path.name}"'}
+        )
+
+    @app.post("/api/score-pdb")
+    def score_pdb_endpoint(req: dict):
+        """Score a local PDB file: extract coords + sequence, compute all signals."""
+        pdb_text = req.get("pdb_text", "")
+        if not pdb_text:
+            raise HTTPException(status_code=400, detail="pdb_text required")
+
+        # Parse PDB → coords + sequence
+        import re
+        atoms = []
+        for line in pdb_text.split('\n'):
+            if not line.startswith('ATOM'):
+                continue
+            atom_name = line[12:16].strip()
+            res_name = line[17:20].strip().upper()
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+            except (ValueError, IndexError):
+                continue
+            atoms.append({'atom': atom_name, 'res': res_name, 'x': x, 'y': y, 'z': z})
+
+        # Build sequence from P atoms (one per residue)
+        base_map = {'A': 'A', 'U': 'U', 'G': 'G', 'C': 'C', 'T': 'U',
+                     'DA': 'A', 'DT': 'T', 'DG': 'G', 'DC': 'C'}
+        p_atoms = [a for a in atoms if a['atom'] == 'P']
+        seq = ''.join(base_map.get(a['res'], 'N') for a in p_atoms)
+        coords = np.array([[a['x'], a['y'], a['z']] for a in p_atoms])
+
+        if len(seq) < 2:
+            raise HTTPException(status_code=400, detail="need >=2 P atoms")
+
+        # Compute signals
+        signals = {}
+        L = len(seq)
+
+        # Physical
+        from .predictor import compute_signals, compute_circdesign_signals
+        signals = compute_signals(seq, coords)
+        circdesign = compute_circdesign_signals(seq)
+        signals.update(circdesign)
+
+        # rsRNASP1
+        try:
+            from .rsrasp_wrapper import score_pdb_file
+            rsp1 = score_pdb_file(pdb_text)
+            if rsp1 is not None:
+                signals['rsrasp1_energy'] = float(rsp1)
+                signals['rsrasp1_energy_per_nt'] = float(rsp1 / max(L, 1))
+        except Exception:
+            pass
+
+        return {"signals": signals, "sequence": seq, "length": L}
+
     # ---- predict (async) ----
     @app.post("/api/predict", response_model=JobCreated)
     async def predict(req: PredictRequest) -> JobCreated:
@@ -200,15 +280,30 @@ def create_app(config: Optional[ServerConfig] = None) -> "FastAPI":
             )
 
         job_id = store.create(req.sequence)
+        # 把参数传给 _run_job
+        job_params = {
+            "max_seg_len": req.max_seg_len,
+            "overlap": req.overlap,
+            "n_relax_rounds": req.n_relax_rounds,
+            "n_rest2_replicas": req.n_rest2_replicas,
+            "rest2_nsteps": req.rest2_nsteps,
+            "use_rl_mcts": req.use_rl_mcts,
+            "use_rhofold": req.use_rhofold,
+            "backend": req.backend,
+        }
+        store._jobs[job_id]["params"] = job_params
         asyncio.create_task(_run_job(app, store, job_id, req.sequence))
         return JobCreated(job_id=job_id)
 
     async def _run_job(app, store: _JobStore, job_id: str, sequence: str) -> None:
         predictor: TorusFoldPredictor = app.state.predictor
+        params = store._jobs[job_id].get("params", {})
         store.set_running(job_id)
         try:
             # to_thread keeps the blocking torch forward off the event loop.
-            result = await asyncio.to_thread(predictor.predict, sequence)
+            result = await asyncio.to_thread(
+                predictor.predict, sequence, **params
+            )
             store.set_done(job_id, result)
         except Exception as exc:
             store.set_error(job_id, f"{type(exc).__name__}: {exc}")

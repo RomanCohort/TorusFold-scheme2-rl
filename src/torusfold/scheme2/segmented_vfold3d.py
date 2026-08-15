@@ -702,6 +702,10 @@ def cross_chunk_relaxation(
 
         system = openmm.System()
 
+        # 添加 P 原子质量
+        for i in range(L):
+            system.addParticle(110.0)
+
         # 键长约束 (harmonic)
         force = openmm.HarmonicBondForce()
         for i in range(L - 1):
@@ -721,7 +725,7 @@ def cross_chunk_relaxation(
         # 碰撞惩罚 (Lennard-Jones)
         lj_force = openmm.NonbondedForce()
         for i in range(L):
-            lj_force.addParticle(0.0, 1.0 * unit.angstrom)  # 无电荷
+            lj_force.addParticle(0.0, 1.0 * unit.angstrom, 0.0)  # OpenMM 8.x: charge, sigma, epsilon
         # 碰撞排斥
         for i in range(L):
             for j in range(i + 1, min(i + 10, L)):  # 只近邻
@@ -762,6 +766,7 @@ def _resolve_chunk_msa(
     output_dir: Path,
     rfam_cm: str = "",
     rfam_dir: str = "",
+    covary_prob: float = 0.6,
 ) -> Optional[str]:
     """为 chunk 解析 MSA (真 MSA 优先, 伪 MSA 兜底).
 
@@ -811,7 +816,8 @@ def _resolve_chunk_msa(
 
     # 3) 伪 MSA: 结构约束兜底
     try:
-        msa = _build_pseudo_msa_for_chunk(seq, ss, str(seg_dir), f"seg{seg_idx}")
+        msa = _build_pseudo_msa_for_chunk(seq, ss, str(seg_dir), f"seg{seg_idx}",
+                                            covary_prob=covary_prob)
         if msa:
             return msa
     except Exception as e:
@@ -894,11 +900,15 @@ def _match_known_family_msa(seg: dict, rfam_dir: str) -> Optional[str]:
     return None
 
 
-def _build_pseudo_msa_for_chunk(seq: str, ss: str, out_dir: str, name: str) -> Optional[str]:
+def _build_pseudo_msa_for_chunk(seq: str, ss: str, out_dir: str, name: str,
+                                  covary_prob: float = 0.6) -> Optional[str]:
     """用 ViennaRNA bpp + dot-bracket 构造伪 MSA (结构约束兜底).
 
     把序列复制成多行, 对配对的互补残基做协同变异 (保持互补),
     模拟进化共变信号, 让 RhoFold 能把配对折叠出来.
+
+    Args:
+        covary_prob: 每个配对位点发生协同变异的概率 (0.0=不变, 1.0=全变). 默认 0.6.
 
     内联实现 (不依赖 scripts/pseudo_msa.py, 避免 sys.path 问题).
     """
@@ -930,12 +940,12 @@ def _build_pseudo_msa_for_chunk(seq: str, ss: str, out_dir: str, name: str) -> O
             for (i, j) in pairs:
                 if i < L and j < L:
                     b1, b2 = s[i], s[j]
-                    if (b1, b2) in _wc_set and rng.random() < 0.6:
-                        # 协同变异: 换成另一对互补 (A-U <-> G-C <-> G-U)
-                        choices = [x for x in [("A", "U"), ("U", "A"),
-                                               ("G", "C"), ("C", "G"),
-                                               ("G", "U"), ("U", "G")]
-                                   if x != (b1, b2) and x[0] == b1]
+                    if rng.random() < covary_prob:
+                        # 协同变异: 换成任意互补对 (保持配对, 两个碱基都可以变)
+                        _all_pairs = [("A", "U"), ("U", "A"),
+                                      ("G", "C"), ("C", "G"),
+                                      ("G", "U"), ("U", "G")]
+                        choices = [x for x in _all_pairs if x != (b1, b2)]
                         if choices:
                             s[i], s[j] = rng.choice(choices)
             rows.append("".join(s))
@@ -950,6 +960,72 @@ def _build_pseudo_msa_for_chunk(seq: str, ss: str, out_dir: str, name: str) -> O
         return out_path
     except Exception:
         return None
+
+
+def compute_covariation_matrix(msa_seqs: List[str]) -> Tuple[np.ndarray, np.ndarray]:
+    """从 MSA 序列列表计算 co-variation 矩阵.
+
+    使用互信息 (Mutual Information) 度量位点间共变信号,
+    适合伪 MSA 或真 MSA 的质量评估与可视化.
+
+    Returns:
+        (mi_matrix, bg_matrix): mi_matrix 是 MI 矩阵 (L x L),
+        bg_matrix 是零模型期望 MI (用于 Z-score 标准化).
+    """
+    N = len(msa_seqs)
+    L = len(msa_seqs[0])
+    base_idx = {'A': 0, 'U': 1, 'G': 2, 'C': 3}
+
+    # 预编码 MSA 为整数矩阵
+    enc = np.full((N, L), -1, dtype=np.int8)
+    for k, seq in enumerate(msa_seqs):
+        for i, ch in enumerate(seq):
+            if ch in base_idx:
+                enc[k, i] = base_idx[ch]
+
+    # 单位点频率
+    freq = np.zeros((L, 4))
+    for k in range(N):
+        for i in range(L):
+            bi = enc[k, i]
+            if bi >= 0:
+                freq[i, bi] += 1
+    freq /= N
+
+    # 互信息矩阵 (逐对计算, 避免 joint 数组维度混淆)
+    mi = np.zeros((L, L))
+    for i in range(L):
+        for j in range(i + 1, L):
+            # 联合分布 4x4
+            joint = np.zeros((4, 4))
+            for k in range(N):
+                bi, bj = enc[k, i], enc[k, j]
+                if bi >= 0 and bj >= 0:
+                    joint[bi, bj] += 1
+            joint /= N
+
+            mi_val = 0.0
+            for a in range(4):
+                for b in range(4):
+                    pxy = joint[a, b]
+                    px, py = freq[i, a], freq[j, b]
+                    if pxy > 0 and px > 0 and py > 0:
+                        mi_val += pxy * np.log2(pxy / (px * py))
+            mi[i, j] = mi[j, i] = mi_val
+
+    # 零模型 MI
+    bg = np.zeros((L, L))
+    for i in range(L):
+        for j in range(i + 1, L):
+            bg_val = 0.0
+            for a in range(4):
+                for b in range(4):
+                    px, py = freq[i, a], freq[j, b]
+                    if px > 0 and py > 0:
+                        bg_val += px * py * np.log2(1.0 / (px * py))
+            bg[i, j] = bg[j, i] = bg_val
+
+    return mi, bg
 
 
 def _parse_dotbracket_strict(ss: str) -> List[Tuple[int, int]]:
@@ -998,6 +1074,7 @@ def segmented_vfold3d_pipeline(
     rfam_cm: str = "",
     rfam_dir: str = "",
     msa_blocks: Optional[List[Dict]] = None,
+    pseudo_msa_covary_prob: float = 0.6,
 ) -> Tuple[np.ndarray, str, List[float], float]:
     """分段 3D 预测 + Kabsch 拼装完整管线.
 
@@ -1090,6 +1167,7 @@ def segmented_vfold3d_pipeline(
                     msa_path = _resolve_chunk_msa(
                         seg, idx, seg_dir, output_dir,
                         rfam_cm=rfam_cm, rfam_dir=rfam_dir,
+                        covary_prob=pseudo_msa_covary_prob,
                     )
                     if msa_path:
                         print(f"  段 {idx}: 用 MSA 喂 RhoFold ({Path(msa_path).name})")

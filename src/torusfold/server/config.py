@@ -37,7 +37,7 @@ class ServerConfig:
 
     # Sequence validation bounds (inclusive).
     min_seq_len: int = 10
-    max_seq_len: int = 500
+    max_seq_len: int = 999999
 
     # Force a backend regardless of weights presence.
     # "" = auto; "scheme10" / "scheme2" / "af3" / "polygon" = force.

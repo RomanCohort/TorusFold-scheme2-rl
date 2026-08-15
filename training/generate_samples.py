@@ -175,6 +175,7 @@ def main():
     p.add_argument("--platform", default="CPU")
     p.add_argument("--out", default=str(OUT_DIR))
     p.add_argument("--smoke", action="store_true", help="小样本验证 (覆盖 n=10)")
+    p.add_argument("--resume", action="store_true", help="断点续跑: 跳过已生成的 N 条, 从 sample_N 接着写")
     args = p.parse_args()
 
     if args.smoke:
@@ -191,9 +192,16 @@ def main():
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ok = 0
+    # 断点续跑: 扫描已有 pkl, ok 从已有数量开始 (避免覆盖之前成果)
+    existing = sorted(out_dir.glob("sample_*.pkl"))
+    ok = len(existing)
+    if ok > 0:
+        print(f"[resume] 已有 {ok} 条样本, 从 sample_{ok:05d} 接着写")
     skip = {"no_far": 0, "cg_fail": 0}
     for idx, seq in enumerate(sampled):
+        # 续跑: 跳过前 ok 条对应的采样序列 (同 seed 同序列, 已生成过)
+        if args.resume and idx < ok:
+            continue
         sample, reason = generate_one(seq, args.platform)
         if sample is None:
             skip[reason] += 1
@@ -202,7 +210,7 @@ def main():
             pickle.dump(sample, f)
         ok += 1
         if (idx + 1) % 10 == 0 or idx == 0:
-            print(f"[{idx+1}/{n_sample}] 成功 {ok}, 无远端 {skip['no_far']}, "
+            print(f"[{idx+1}/{args.n}] 成功 {ok}, 无远端 {skip['no_far']}, "
                   f"CG失败 {skip['cg_fail']}, L={len(seq)}")
 
     print(f"\n完成: {ok} 样本 -> {out_dir}")

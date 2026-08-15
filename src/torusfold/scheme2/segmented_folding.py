@@ -112,6 +112,7 @@ def build_segmented_3bead_system(
     pair_gate: bool = False,
     pair_eps: float = 30.0,
     enabled: Optional[List[bool]] = None,
+    rl_far_pairs: Optional[List[Tuple[int, int]]] = None,
     **kwargs,
 ):
     """构建分段 3-bead 力场: 茎区A-form螺旋(二面角+堆叠), 环区松散(只clash).
@@ -288,6 +289,20 @@ def build_segmented_3bead_system(
             system.addForce(stat_force)
             print(f"  统计势: {stat_force.getNumBonds()} 个三级接触键")
 
+    # 6b. RL 远端配对引导力 (方案1: RL 指导物理)
+    rl_guide_force = None
+    if rl_far_pairs:
+        rl_guide_force = CustomBondForce(
+            "k_rl * (r - d0)^2 * step(r_max - r)")
+        rl_guide_force.addPerBondParameter("k_rl")
+        rl_guide_force.addPerBondParameter("d0")
+        rl_guide_force.addGlobalParameter("r_max", 3.0)  # 30Å 截断
+        for (i, j) in rl_far_pairs:
+            if 0 <= i < L and 0 <= j < L:
+                rl_guide_force.addBond(P(i), P(j), [5.0, 2.0])  # k=5, d0=2nm(20Å)
+        if rl_guide_force.getNumBonds() > 0:
+            system.addForce(rl_guide_force)
+
     # 7. 非键 clash + 静电 (CutoffNonPeriodic)
     clash_force = None
     if en[7]:
@@ -326,7 +341,7 @@ def build_segmented_3bead_system(
                         excluded.add(k); clash_force.addExclusion(*k)
         system.addForce(clash_force)
 
-    return system, coords_nm, pair_force, pair_bonds, bsj_force
+    return system, coords_nm, pair_force, pair_bonds, bsj_force, rl_guide_force
 
 
 def init_from_secondary_structure(
@@ -373,9 +388,14 @@ def init_from_secondary_structure(
         i_chain = [p[0] for p in stem]
         j_chain = [p[1] for p in stem]
         if n_stems <= 4:
-            stem_len_A = max(6.0, n * 2.8)  # 茎沿轴长度 (每对2.8A)
-            center = np.array([x_cursor + stem_len_A / 2.0, 0.0, 0.0])
-            x_cursor += stem_len_A + 12.0
+            # 球面分布 (修复: 旧版沿x轴排→平面结构)
+            R_helix = 15.0
+            phi = math.acos(1.0 - 2.0 * (si + 0.5) / n_stems)
+            theta = 2.39996 * si  # 黄金角
+            center = R_helix * np.array([
+                math.sin(phi) * math.cos(theta),
+                math.sin(phi) * math.sin(theta),
+                math.cos(phi)])
         elif n_stems <= 16:
             R_helix = 12.0
             theta = 2.0 * math.pi * si / n_stems * 1.5
@@ -470,6 +490,7 @@ def refine_segmented_3bead(
     enabled: Optional[List[bool]] = None,
     stat_pot_path: Optional[str] = None,  # 统计势文件路径
     sequence: Optional[str] = None,  # RNA 序列 (用于统计势)
+    rl_far_pairs: Optional[List[Tuple[int, int]]] = None,  # RL 远端配对引导
 ) -> Tuple[np.ndarray, float, float]:
     """分段 3-bead 折叠: 茎区A-form螺旋/环区松散 + 三阶段BSJ退火.
 
@@ -503,12 +524,13 @@ def refine_segmented_3bead(
     # 配对距离自然满足, 力场只需局部松弛.
     p_init = init_from_secondary_structure(L, pairs)
 
-    system, coords_nm, pair_force, pair_bonds, bsj_force = \
+    system, coords_nm, pair_force, pair_bonds, bsj_force, rl_guide_force = \
         build_segmented_3bead_system(p_init, pairs, stems,
                                      pair_gate=pair_gate, pair_eps=pair_eps,
                                      enabled=enabled,
                                      stat_pot_path=stat_pot_path,
-                                     sequence=sequence)
+                                     sequence=sequence,
+                                     rl_far_pairs=rl_far_pairs)
 
     topo = Topology()
     chain = topo.addChain()
@@ -545,23 +567,29 @@ def refine_segmented_3bead(
         bsj_force.setBondParameters(0, 3*(L-1), 0, [scale * 500.0, BOND_LEN / 10.0])
         bsj_force.updateParametersInContext(sim.context)
 
+    # RL 远端引导力: 渐进增强 (阶段1弱→阶段3强)
+    def set_rl_guide_k(k_rl):
+        if rl_guide_force is None:
+            return
+        for bidx in range(rl_guide_force.getNumBonds()):
+            i, j = rl_guide_force.getBondParameters(bidx)[:2]
+            rl_guide_force.setBondParameters(bidx, i, j, [k_rl, 2.0])
+        rl_guide_force.updateParametersInContext(sim.context)
+
     # 三阶段: 弱BSJ形成茎螺旋 → 强配对+中BSJ拉拢配对 → 强BSJ闭合
-    # 低温避免散开. 阶段2 用强配对把散开配对(17A)拉拢到5A, 多步MD收敛.
     pre_md = sim.context.getState(getPositions=True, getEnergy=True)
-    # 阶段1: 配对保持强(1.0)! 初始minimize已把配对放对位置(9.9Å),
-    # 弱化配对会被clash/堆叠推到15Å (诊断: 弱配对k=0.3→pair_rate 0.16).
-    # 只弱BSJ让结构微调, 配对不动.
-    set_pair_k(1.0); set_bsj_k(0.1)
+    # 阶段1: 配对强 + 弱BSJ + RL弱引导
+    set_pair_k(1.0); set_bsj_k(0.1); set_rl_guide_k(2.0)
     sim.integrator.setTemperature(300 * unit.kelvin)
     sim.step(n_anneal); sim.minimizeEnergy(maxIterations=2000)
 
-    # 阶段2: 配对强 + BSJ中, 压缩+闭合
-    set_pair_k(1.0); set_bsj_k(0.5)
+    # 阶段2: 配对强 + BSJ中 + RL中引导
+    set_pair_k(1.0); set_bsj_k(0.5); set_rl_guide_k(10.0)
     sim.integrator.setTemperature(300 * unit.kelvin)
     sim.step(n_anneal * 3); sim.minimizeEnergy(maxIterations=3000)
 
-    # 阶段3: 低温 + 配对强 + BSJ强, 最终闭合
-    set_pair_k(1.0); set_bsj_k(5.0)
+    # 阶段3: 低温 + 配对强 + BSJ强 + RL强引导
+    set_pair_k(1.0); set_bsj_k(5.0); set_rl_guide_k(30.0)
     sim.integrator.setTemperature(290 * unit.kelvin)
     sim.step(n_anneal * 2)
     sim.minimizeEnergy(tolerance=10.0 * unit.kilojoules_per_mole / unit.nanometer,

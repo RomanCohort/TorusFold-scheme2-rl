@@ -32,6 +32,7 @@ from torusfold.scheme2.rl_optimizer import (  # noqa: E402
     RLOptimizerState, PolicyNetwork, MCTS, apply_action, compute_reward,
     build_rl_state, _rebuild_blocks, _get_torch,
     N_DIRECTIONS, N_STEPS, DIRECTIONS, STEP_SIZES, WC_TARGET_DIST,
+    set_dpo_policy, _dpo_value,
 )
 
 # ---------- PPO 超参 ----------
@@ -46,6 +47,10 @@ PPO_EPOCHS = 4          # 每批数据重用次数
 EPISODE_LEN = 20        # 单条样本采多少步动作
 ROLLOUT_DEPTH = 3       # 采轨迹时评估 reward 用短 rollout (省时间)
 MAX_GRAD_NORM = 0.5     # 梯度裁剪 (防 KL 爆炸)
+
+# DPO reward 开关: True 时 roll_episode 用 DPO V (3ms) 替代 compute_reward (1295ms).
+# 由 main 的 --dpo-reward 设置. DPO policy 需全局注册 (set_dpo_policy).
+_DPO_REWARD = False
 
 
 class RunningMeanStd:
@@ -123,12 +128,19 @@ def roll_episode(
     sample: dict,
     ep_len: int = EPISODE_LEN,
     rms: "RunningMeanStd" = None,
+    heuristic_ratio: float = 0.0,
+    target_dists=None,
 ) -> List[dict]:
     """用 policy 采一条轨迹。
 
     每步: policy.forward 采样动作 -> apply_action -> compute_reward。
     记录 (state_snapshot, action, log_prob, reward, value)。
     reward 经 rms 标准化 (bug② 修), V 头拟合标准化后值。
+
+    heuristic_ratio (方案: 训练初期 warmup): 0.0=纯 policy 采样,
+        >0 时该比例的步用 MCTS._heuristic_action 采 (训练初期 policy 随机,
+        rollout 质量差, 掺入启发式保证 reward 信号非平凡)。随 epoch 降到 0。
+    target_dists: per-pair 目标距离 (方案 A), None 时统一 WC_TARGET_DIST。
     """
     torch = _get_torch()
     state = build_rl_state(
@@ -138,6 +150,12 @@ def roll_episode(
     if not state.far_blocks:
         return []
 
+    # heuristic warmup 用: 复用一个无策略 MCTS 的启发式选动作
+    heuristic = None
+    if heuristic_ratio > 0.0:
+        _mcts_tmp = MCTS(policy=None, n_simulations=1, use_rollout=False)
+        heuristic = _mcts_tmp._heuristic_action
+
     trajectory = []
     cur_p = state.p_coords.copy()
     for step in range(ep_len):
@@ -146,23 +164,55 @@ def roll_episode(
             far_blocks=_rebuild_blocks(state, cur_p),
             far_pairs=state.far_pairs, block_edges=state.block_edges,
         )
-        pi_b, pi_d, pi_s, v = policy.forward(cur_state, return_value=True)
+        # forward(return_value=True) 返回 7 元组: pi_region, pi_block, pi_type,
+        #   pi_trans_dir, pi_rot_axis, pi_step, v
+        pi_region, pi_b, pi_type, pi_td, pi_ra, pi_s, v = policy.forward(cur_state, return_value=True)
         n_blocks = len(cur_state.far_blocks)
         if pi_b is None:
             break
 
-        # 采样动作 (从 policy 分布)
-        bidx = int(torch.multinomial(pi_b, 1).item())
-        didx = int(torch.multinomial(pi_d, 1).item())
-        sidx = int(torch.multinomial(pi_s, 1).item())
-        # log_prob = log π_block[b] + log π_dir[d] + log π_step[s]
-        logp = (torch.log(pi_b[bidx] + 1e-8) +
-                torch.log(pi_d[didx] + 1e-8) +
-                torch.log(pi_s[sidx] + 1e-8))
+        # 采样动作: heuristic_ratio 比例的步用启发式, 其余用 policy
+        if heuristic is not None and np.random.random() < heuristic_ratio:
+            bidx, didx, sidx = heuristic(cur_state, state.far_pairs)
+            # log_prob 仍用 policy 估 (off-policy: 行为=heuristic, 学习=policy)
+            # 从扁平 didx 还原两层信息
+            if didx < N_DIRECTIONS:
+                type_id, dir_axis, logp_cond = 0, didx, torch.log(pi_td[didx] + 1e-8)
+            else:
+                type_id, dir_axis = 1, didx - N_DIRECTIONS
+                logp_cond = torch.log(pi_ra[dir_axis] + 1e-8)
+            logp = (torch.log(pi_b[bidx] + 1e-8) +
+                    torch.log(pi_type[type_id] + 1e-8) +
+                    logp_cond +
+                    torch.log(pi_s[sidx] + 1e-8))
+        else:
+            bidx = int(torch.multinomial(pi_b, 1).item())
+            type_id = int(torch.multinomial(pi_type, 1).item())
+            if type_id == 0:
+                dir_axis = int(torch.multinomial(pi_td, 1).item())
+                didx = dir_axis  # 0-5 平移
+                logp_cond = torch.log(pi_td[dir_axis] + 1e-8)
+            else:
+                dir_axis = int(torch.multinomial(pi_ra, 1).item())
+                didx = N_DIRECTIONS + dir_axis  # 6-11 旋转
+                logp_cond = torch.log(pi_ra[dir_axis] + 1e-8)
+            sidx = int(torch.multinomial(pi_s, 1).item())
+            logp = (torch.log(pi_b[bidx] + 1e-8) +
+                    torch.log(pi_type[type_id] + 1e-8) +
+                    logp_cond +
+                    torch.log(pi_s[sidx] + 1e-8))
 
-        # 执行 + reward (绝对值, 不用差分 shaping)
+        # 执行 + reward (方案 A: per-pair target_dists)
         new_p = apply_action(cur_state, bidx, didx, sidx)
-        r_raw = float(compute_reward(new_p, state.far_pairs))
+        if _DPO_REWARD:
+            # DPO reward: 用 DPO V (3ms) 替代完整 compute_reward (1295ms) 做训练信号.
+            # DPO V 与 compute_reward 排序对齐 (Spearman 0.73), 方向正确.
+            # 训练快 ~400x, 见 2026-08-02. 训练后可用完整 reward 微调.
+            _v = _dpo_value(new_p, state.far_pairs, sequence=state.sequence)
+            r_raw = float(_v) if _v is not None else 0.0
+        else:
+            r_raw = float(compute_reward(new_p, state.far_pairs,
+                                          target_dists=target_dists))
         # 标准化 reward: 更新 rms 统计 + 归一 (bug② 修)
         if rms is not None:
             rms.update(r_raw)
@@ -273,12 +323,18 @@ def ppo_update(
         cnt = 0
         for t, trans in enumerate(flat_traj):
             state = _rebuild_state(trans)
-            pi_b, pi_d, pi_s, v = policy.forward(state, return_value=True)
+            pi_region, pi_b, pi_type, pi_td, pi_ra, pi_s, v = policy.forward(state, return_value=True)
             if pi_b is None:
                 continue
             bidx, didx, sidx = trans["action"]
+            # 两层 log_prob: block + type + (dir | axis) + step
+            if didx < N_DIRECTIONS:
+                logp_cond = torch.log(pi_td[didx] + 1e-8)
+            else:
+                logp_cond = torch.log(pi_ra[didx - N_DIRECTIONS] + 1e-8)
             logp_new = (torch.log(pi_b[bidx] + 1e-8) +
-                        torch.log(pi_d[didx] + 1e-8) +
+                        torch.log(pi_type[0 if didx < N_DIRECTIONS else 1] + 1e-8) +
+                        logp_cond +
                         torch.log(pi_s[sidx] + 1e-8))
             logp_old = trans["log_prob_old"]
             ratio = torch.exp(logp_new - logp_old)
@@ -287,8 +343,11 @@ def ppo_update(
             surr2 = torch.clamp(ratio, 1 - PPO_CLIP, 1 + PPO_CLIP) * adv
             policy_loss = -torch.min(surr1, surr2)
             value_loss = (v - all_ret_t[t]) ** 2
+            # 两层熵: block + type + (dir, axis) + step
             entropy = -(pi_b * torch.log(pi_b + 1e-8)).sum() - \
-                      (pi_d * torch.log(pi_d + 1e-8)).sum() - \
+                      (pi_type * torch.log(pi_type + 1e-8)).sum() - \
+                      (pi_td * torch.log(pi_td + 1e-8)).sum() - \
+                      (pi_ra * torch.log(pi_ra + 1e-8)).sum() - \
                       (pi_s * torch.log(pi_s + 1e-8)).sum()
             loss = policy_loss + VALUE_COEF * value_loss - ENTROPY_COEF * entropy
             total_loss = total_loss + loss
@@ -325,17 +384,33 @@ def _group_traj_by_episode(batch_traj: List[dict]) -> List[List[dict]]:
 
 
 def evaluate(policy: PolicyNetwork, samples: List[dict],
-             n_simulations: int = 20) -> float:
-    """用 MCTS 跑 evaluate, 返回平均 reward 提升。"""
-    mcts = MCTS(policy=policy, n_simulations=n_simulations, use_rollout=True)
+             n_simulations: int = 8) -> float:
+    """用 MCTS 跑 evaluate, 返回平均 reward 提升。
+
+    ⚠️ 修复 (2026-08-02): 原用完整 MCTS (n_sim=20, rollout=True), 每样本 20×4.4s≈88s,
+    8 样本≈700s 卡死训练. 改 DPO 快速模式 (dpo_simulate=True, 20ms/模拟):
+    - reward 用 DPO V (与 compute_reward 排序对齐 Spearman 0.73, 相对改进可测)
+    - 训练监控指标, 不要求绝对物理值
+    """
+    use_dpo = _DPO_REWARD
+    mcts = MCTS(policy=policy, n_simulations=n_simulations, use_rollout=False,
+                dpo_simulate=use_dpo)
     improvements = []
     for s in samples[:8]:  # 评估子集
         state = build_rl_state(s["p_coords"], s["seq"], s["far_pairs"], s["stem_blocks"])
         if not state.far_blocks:
             continue
-        r_before = compute_reward(s["p_coords"], s["far_pairs"])
-        opt = mcts.search(state, s["far_pairs"])
-        r_after = compute_reward(opt, s["far_pairs"])
+        if use_dpo:
+            r_before = _dpo_value(s["p_coords"], s["far_pairs"], sequence=s["seq"]) or 0.0
+        else:
+            r_before = compute_reward(s["p_coords"], s["far_pairs"])
+        dist = mcts.search(state, s["far_pairs"])
+        # MCTS.search 返回 ConformationDistribution (DRAG 分层后), 取 mode 构象
+        opt = dist.mode_coords if hasattr(dist, "mode_coords") and dist.mode_coords is not None else dist
+        if use_dpo:
+            r_after = _dpo_value(opt, s["far_pairs"], sequence=s["seq"]) or 0.0
+        else:
+            r_after = compute_reward(opt, s["far_pairs"])
         improvements.append(r_after - r_before)
     return float(np.mean(improvements)) if improvements else 0.0
 
@@ -351,7 +426,25 @@ def main():
     p.add_argument("--out", default="models/rl")
     p.add_argument("--smoke", action="store_true")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--dpo-reward", action="store_true",
+                   help="用 DPO V (3ms) 替代完整 compute_reward (1295ms) 做训练 reward, 快 ~400x")
+    p.add_argument("--dpo-policy", default=None,
+                   help="DPO policy 权重路径 (--dpo-reward 时需要)")
     args = p.parse_args()
+
+    # DPO reward 模式: 加载并全局注册 DPO policy
+    global _DPO_REWARD
+    if args.dpo_reward:
+        _DPO_REWARD = True
+        dpo_path = args.dpo_policy or "data/dpo_policy_v3_compat.pt"
+        try:
+            dpo_pol = PolicyNetwork()
+            dpo_pol.load(dpo_path)
+            set_dpo_policy(dpo_pol)
+            print(f"[train_ppo] DPO reward 模式: {dpo_path}")
+        except Exception as exc:
+            print(f"[train_ppo] DPO policy 加载失败, 回退完整 reward: {exc!r}")
+            _DPO_REWARD = False
 
     if args.smoke:
         args.epochs = 2
@@ -377,6 +470,16 @@ def main():
     # 消融: gnn vs mlp
     n_mp = 3 if args.variant == "gnn" else 0
     policy = PolicyNetwork(hidden_dim=128, n_mp_layers=n_mp)
+
+    # 自动检测 GPU (ROCm/NVIDIA CUDA)
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        policy = policy.to(device)
+        print(f"[train_ppo] GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device('cpu')
+        print("[train_ppo] CPU only")
+
     optimizer = torch.optim.AdamW(policy.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     rms = RunningMeanStd()  # bug②: reward 标准化统计
 
@@ -385,12 +488,20 @@ def main():
         "n_mp_layers": n_mp, "ep_len": args.ep_len, "batch": args.batch,
     }}
 
+    # heuristic warmup 衰减: 训练初期掺启发式保证 rollout 质量,
+    # 随 epoch 降到 0 (前 20% epoch 用 0.5, 渐降到 0)
+    warmup_epochs = max(1, int(args.epochs * 0.20))
+
     for epoch in range(args.epochs):
         np.random.shuffle(samples)
+        # heuristic ratio 衰减: max(0, 0.5*(1 - epoch/warmup_epochs))
+        heuristic_ratio = max(0.0, 0.5 * (1.0 - epoch / warmup_epochs)) if warmup_epochs > 0 else 0.0
+
         # 收集一批轨迹 (按 episode 分组, 不 flatten)
         batch_episodes = []
         for s in samples[:args.batch]:
-            traj = roll_episode(policy, s, ep_len=args.ep_len, rms=rms)
+            traj = roll_episode(policy, s, ep_len=args.ep_len, rms=rms,
+                                heuristic_ratio=heuristic_ratio)
             if traj:
                 batch_episodes.append(traj)
 

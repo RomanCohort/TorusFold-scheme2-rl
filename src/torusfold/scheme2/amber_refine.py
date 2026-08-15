@@ -20,6 +20,15 @@ A-form RNA 合理构象。
 
 from __future__ import annotations
 
+import sys
+
+# Windows GBK 编码 workaround: print 含非 ASCII 字符（如 Å）时 GBK 打不出
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass  # 忽略重配失败（某些环境不允许）
+
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -28,6 +37,21 @@ from .allatom_reconstruct import AllAtomStructure, get_atom_xyzs
 
 
 REFINE_TIMEOUT_S = 600.0
+
+
+def _detect_platform() -> str:
+    """自动检测最佳 OpenMM 平台: CUDA > OpenCL > CPU."""
+    try:
+        from openmm import Platform
+        for name in ("CUDA", "OpenCL"):
+            try:
+                Platform.getPlatformByName(name)
+                return name
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    return "CPU"
 
 # P 原子 positional restraint 力常数 (kJ/mol/nm²)。
 # 旧值 10 太软, amber 最小化时 P 跑 3.95Å (超 2.0 阈值)。
@@ -169,7 +193,7 @@ _RNA_H_MAP: Dict[str, Dict[str, List[Tuple[str, str]]]] = {
     # 嘧啶碱基 H
     "C5":  {"U": [("H5", "H")], "C": [("H5", "H")]},
     "C6":  {"U": [("H6", "H")], "C": [("H6", "H")]},
-    "N3":  {"U": [("H3", "H")]},          # U 的 N3-H3
+    "N3":  {"U": [("H3", "H")]},  # 仅 U 的 N3-H3; C 的 N3 是双键不能接 H
     "N4":  {"C": [("H41", "H"), ("H42", "H")]},
     # 这些重原子在任何碱基都不带 H
     "O5'": {}, "O3'": {}, "O6": {}, "O2": {}, "O4": {},
@@ -304,21 +328,25 @@ def _add_rna_bonds(topo, res_atoms, structure):
                     topo.addBond(heavy_atom, h_atom)
 
     # 残基间磷酸二酯键: O3'[i] ↔ P[i+1], i=0..L-2
-    # 不加 BSJ 拓扑键 — 用 ignoreExternalBonds=True 让首末残基匹配中间模板。
-    # BSJ 闭合由 amber_refine 里的 HarmonicBondForce 物理约束保证,
-    # 最小化后不影响配图 (BSJ 局部)。
     for i in range(L - 1):
         o3 = res_atoms[i].get("O3'")
         p_next = res_atoms[i + 1].get("P")
         if o3 is not None and p_next is not None:
             topo.addBond(o3, p_next)
 
+    # BSJ 拓扑键: O3'[L-1] ↔ P[0] (circRNA 环形拓扑)
+    # 必须加此键, 否则 residue 0 被当成 5' 端点, amber14 匹配 A5/A3 模板失败。
+    o3_last = res_atoms[-1].get("O3'")
+    p_first = res_atoms[0].get("P")
+    if o3_last is not None and p_first is not None:
+        topo.addBond(o3_last, p_first)
+
 
 def amber_refine(
     structure: AllAtomStructure,
     pairs: List[Tuple[int, int, float]],
     *,
-    platform_name: str = "CPU",
+    platform_name: str = "auto",
     max_iterations: int = 3000,
     use_md_for_long: bool = True,
     long_threshold: int = 200,
@@ -326,6 +354,7 @@ def amber_refine(
     coding_mask: Optional[np.ndarray] = None,
     cg_coords: Optional[np.ndarray] = None,
     coding_restraint_k: float = 10000.0,
+    cg_topology_weight: float = 0.0,  # 方案 F: 非 coding P 融合 CG 全局拓扑权重
     use_o3p_bond: bool = False,
     use_o3p_angle: bool = False,
 ) -> Tuple[np.ndarray, float, float, Dict[str, int]]:
@@ -336,6 +365,9 @@ def amber_refine(
     cg_coords: (L, 3) nm, coding 钉死的目标坐标 (CG 原坐标)。
         不传时用 structure 里的 P 坐标 (即 RL 优化后的位置, 等于没钉死)。
     coding_restraint_k: coding 钉死力常数 (kJ/mol/nm²)。默认 10000 = 强钉死。
+    cg_topology_weight: 非 coding 残基 P restraint 目标融合 CG 全局拓扑的权重
+        (0.0=纯 1EHZ Kabsch 模板; 1.0=完全钉回 CG 拓扑)。默认 0.0 保持旧行为。
+        长序列下 >0 让全局拓扑信息进入 amber, 避免 1EHZ 局部模板覆盖全局配对位置。
     use_o3p_bond: P2 键长约束 (O3'-P[i+1] 1.6Å k=10000). 默认关.
     use_o3p_angle: P2.5 键角约束 (C3'-O3'-P / O3'-P-O5'). 默认关.
         (两关 = P1 干净版, 纯 4 点 Kabsch 无额外约束, 用于 P3 对比基线)
@@ -350,6 +382,7 @@ def amber_refine(
             coding_mask=coding_mask,
             cg_coords=cg_coords,
             coding_restraint_k=coding_restraint_k,
+            cg_topology_weight=cg_topology_weight,
             use_o3p_bond=use_o3p_bond,
             use_o3p_angle=use_o3p_angle,
         )
@@ -380,10 +413,16 @@ def _amber_refine_impl(
     coding_mask: Optional[np.ndarray] = None,
     cg_coords: Optional[np.ndarray] = None,
     coding_restraint_k: float = 10000.0,
+    cg_topology_weight: float = 0.0,
     use_o3p_bond: bool = False,
     use_o3p_angle: bool = False,
 ) -> Tuple[np.ndarray, float, float, Dict[str, int]]:
     """Amber14 OL3 + OBC1 约束最小化全原子结构。
+
+    cg_topology_weight: 非 coding 残基 P restraint 目标融合 CG 全局拓扑的权重
+        (0.0=纯 1EHZ Kabsch 模板; 1.0=完全钉回 CG 拓扑)。默认 0.0 保持旧行为。
+        长序列 (>800nt) 下 >0 让全局配对位置信息进入 amber, 避免 1EHZ 局部
+        模板覆盖全局拓扑 (方案 F)。
 
     Returns:
         (refined_coords, e0, e1, info)
@@ -411,17 +450,11 @@ def _amber_refine_impl(
     for new_idx, atom in enumerate(topo.atoms()):
         atom_lookup[(atom.residue.index + 1, atom.name)] = new_idx
 
-    # residueTemplates: 显式指定每个残基用中间模板 A/U/G/C (避免端点 A5/A3 匹配)
     # ignoreExternalBonds: 跳过 ExternalBond 检查 (circRNA 环形拓扑会让 amber 困惑)
-    # implicitSolvent 不传 — amber14-all.xml 已含 GBSA (加载时加了 implicit/obc1.xml),
-    # 传 implicitSolvent=True 会报 "argument never used" (force field 自带溶剂)。
-    residue_templates = {}
-    for i in range(len(structure.residue_atom_spans)):
-        residue_templates[i] = structure.sequence[i]
-
+    # 不用 residueTemplates: circRNA 所有残基都是内部的 (无 5'/3' 端点),
+    # 让 OpenMM 自动匹配内部模板 (A/U/G/C), 避免端点模板 (A5/A3/C5/C3) 干扰。
     system = ff.createSystem(
         topo, constraints=None, rigidWater=True,
-        residueTemplates=residue_templates,
         ignoreExternalBonds=True,
     )
 
@@ -441,6 +474,9 @@ def _amber_refine_impl(
     restraint.addPerParticleParameter("z0")
     p_drift_refs = []  # (new_idx, original_xyz_nm) for 检查
     n_coding_pinned = 0
+    n_topology_fused = 0
+    # 方案 F: 非 coding 区 P 的目标位置融合 CG 全局拓扑。
+    # cg_coords 是 nm, structure P 也是 nm (÷10.0 后)。
     for res_idx in range(L):
         res_seq = res_idx + 1
         new_idx = atom_lookup.get((res_seq, "P"))
@@ -457,6 +493,13 @@ def _amber_refine_impl(
             p_xyz = np.asarray(cg_coords[res_idx], dtype=np.float64)
             k_val = coding_restraint_k
             n_coding_pinned += 1
+        elif (cg_topology_weight > 0.0 and cg_coords is not None
+                and res_idx < len(cg_coords)):
+            # 方案 F: 非 coding 区 P 目标 = (1-w)·1EHZ模板 + w·CG拓扑
+            cg_p = np.asarray(cg_coords[res_idx], dtype=np.float64)
+            tmpl_p = np.asarray(p_xyz, dtype=np.float64)
+            p_xyz = (1.0 - cg_topology_weight) * tmpl_p + cg_topology_weight * cg_p
+            n_topology_fused += 1
         restraint.addParticle(new_idx, [k_val, p_xyz[0], p_xyz[1], p_xyz[2]])
         p_drift_refs.append((new_idx, p_xyz))
     system.addForce(restraint)
@@ -589,11 +632,23 @@ def _amber_refine_impl(
     integrator = LangevinMiddleIntegrator(
         300 * unit.kelvin, 1 / unit.picosecond, 0.002 * unit.picosecond
     )
+    # 解析 "auto" 平台
+    if platform_name == "auto":
+        resolved = _detect_platform()
+        print(f"  [amber_refine] 平台自动检测: {resolved}")
+    else:
+        resolved = platform_name
     try:
-        platform = Platform.getPlatformByName(platform_name)
+        platform = Platform.getPlatformByName(resolved)
         sim = Simulation(topo, system, integrator, platform)
     except Exception:
-        sim = Simulation(topo, system, integrator)
+        fallback = _detect_platform()
+        print(f"  [amber_refine] 平台 {resolved} 不可用, 降级到 {fallback}")
+        try:
+            platform = Platform.getPlatformByName(fallback)
+            sim = Simulation(topo, system, integrator, platform)
+        except Exception:
+            sim = Simulation(topo, system, integrator)
 
     # Modeller 加 H 后的坐标 (nm)
     positions = modeller.getPositions()
@@ -699,6 +754,7 @@ def _amber_refine_impl(
         "max_p_drift": float(max_drift),
         "force_energies": force_energies,
         "n_coding_pinned": n_coding_pinned,
+        "n_topology_fused": n_topology_fused,
         "n_o3p_bonds": n_o3p,
     }
     # 返回重原子坐标 (按 structure.atoms 顺序, 不含 H)。上层直接用 serial 索引。

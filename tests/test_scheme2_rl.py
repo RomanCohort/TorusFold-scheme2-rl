@@ -14,6 +14,9 @@ import pytest
 
 from torusfold.scheme2.rl_optimizer import (
     BlockState,
+    N_DIRECTIONS,
+    N_ROT_AXES,
+    N_STEPS,
     MCTS,
     PolicyNetwork,
     RLOptimizerState,
@@ -134,6 +137,36 @@ class TestComputeReward:
         r = compute_reward(p, far)
         assert isinstance(r, float)
 
+    def test_closure_penalizes_opened_bsj(self):
+        """BSJ 拉开时正则版 reward 低于闭合时 (R_closure 起作用)。"""
+        L = 100
+        p = make_ring_p()
+        far = [(10, 60)]
+        # 闭合状态: p[0] 和 p[-1] 很近
+        r_closed = compute_reward(p, far, use_regularization=True)
+        # 把末端拉开
+        p_opened = p.copy()
+        p_opened[-1] = p_opened[-1] + np.array([50.0, 0.0, 0.0])
+        r_opened = compute_reward(p_opened, far, use_regularization=True)
+        assert r_opened < r_closed, \
+            f"BSJ 拉开应降低 reward: closed={r_closed:.2f} vs opened={r_opened:.2f}"
+
+    def test_target_dists_per_pair(self):
+        """逐对目标距离: 自定义 target 影响 reward。"""
+        L = 10
+        p = np.zeros((L, 3))
+        p[0] = np.array([0.0, 0.0, 0.0])
+        p[1] = np.array([30.0, 0.0, 0.0])
+        far = [(0, 1)]
+        # 用固定目标 20Å: dev=10 -> reward 低
+        r_20 = compute_reward(p, far, use_regularization=False,
+                               target_dists=[WC_TARGET_DIST])
+        # 用 30Å 目标: dev=0 -> reward=1.0
+        r_30 = compute_reward(p, far, use_regularization=False,
+                               target_dists=[30.0])
+        assert r_30 > r_20, f"30Å 目标应高于 20Å 目标: {r_20:.4f} vs {r_30:.4f}"
+        assert abs(r_30 - 1.0) < 1e-9, "dev=0 时 reward 应 = 1.0"
+
 
 # ---------- apply_action ----------
 class TestApplyAction:
@@ -161,6 +194,27 @@ class TestApplyAction:
                 changed = True
                 break
         assert changed, "至少有一个方向应改变配对距离 (否则 i/j 同向平移 bug 回归)"
+
+    def test_rotation_changes_pair_distance(self, ring_state):
+        """旋转动作 (dir_idx>=6) 也应改变 i-j 配对距离。"""
+        p, far, state = ring_state
+        d_before = np.linalg.norm(p[10] - p[60])
+        changed = False
+        for didx in range(N_DIRECTIONS, N_DIRECTIONS + N_ROT_AXES):
+            for sidx in range(N_STEPS):
+                new_p = apply_action(state, 0, didx, sidx)
+                d_after = np.linalg.norm(new_p[10] - new_p[60])
+                if not np.isclose(d_after, d_before):
+                    changed = True
+                    break
+            if changed:
+                break
+        assert changed, "旋转动作应能改变 i-j 配对距离"
+        # j 侧在旋转中不应移动 (只动 i 侧)
+        j_before = p[state.far_blocks[0].residues_j].copy()
+        new_p = apply_action(state, 0, N_DIRECTIONS, 0)
+        assert np.allclose(new_p[state.far_blocks[0].residues_j], j_before), \
+            "旋转应只动 i 侧"
 
     def test_does_not_mutate_input(self, ring_state):
         p, far, state = ring_state

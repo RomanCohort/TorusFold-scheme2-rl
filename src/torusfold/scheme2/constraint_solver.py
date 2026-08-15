@@ -91,9 +91,6 @@ class GeometricConstraintSolver:
                 coords = self._closure_correction(coords)
 
             # 4. Steric clash check (soft: count clashes, don't discard)
-            #    For long sequences with many pair constraints, hard-filtering
-            #    yields 0 conformations. Instead, score clash-count into energy
-            #    so the energy ranking picks the least-clashed one.
             clash_count = self._count_clashes(coords)
 
             # 5. Additional local relaxation (optional)
@@ -122,48 +119,46 @@ class GeometricConstraintSolver:
         """Initialize nucleotides on a ring.
 
         For L < 10: simple planar polygon (short sequences, torus not meaningful).
-        For L >= 10: toroidal helix with A-form RNA geometry (real physics):
-          - Rise = 2.5 Å/residue (A-form standard)
-          - Twist = 32.7°/residue (360°/11bp)
-          - Diameter ~26 Å (A-form double helix)
+        For 10 <= L < 500: toroidal helix with gentle z-oscillation.
+        For L >= 500: pure planar polygon (long sequences rely on OpenMM for 3D).
 
-        Torus knot parameterization (p=1, q=L/11):
-          - Main angle θ = 2πi/L (around torus axis)
-          - Secondary angle φ = 2πqi/L (around helix cross-section)
-          - x = (R + r·cos(φ))·cos(θ), y = (R + r·cos(φ))·sin(θ), z = r·sin(φ)
-
-        This gives initial conformation with A-form twist and z-span ~2r,
-        so the virtual dihedral torsion potential in _compute_cg_energy
-        has gradient to work with (not stuck in planar local minimum).
+        Toroidal helix (gentle version, fixed 2026-07-27):
+          - Original q = L/11 caused d_phi = 32.7°/step → z-jumps → bond ~9.4Å
+          - Fixed: q = L/110 gives d_phi ~3.3°/step → bond ~5.9Å as expected
+          - z-span ~26Å (small oscillation to seed 3D structure)
 
         Returns:
             (L, 3) coordinates
         """
         coords = np.zeros((L, 3), dtype=np.float64)
 
+        # Main ring radius: circumference = L * bond_length
+        R = L * bond_length / (2 * math.pi)
+
         if L < 10:
             # Short sequence: planar polygon
-            R = L * bond_length / (2 * math.pi)
             for i in range(L):
                 angle = 2 * math.pi * i / L
                 coords[i, 0] = R * math.cos(angle)
                 coords[i, 1] = R * math.sin(angle)
                 coords[i, 2] = 0.0
-        else:
-            # Toroidal helix with A-form geometry
-            # Main radius R: circumference = L * bond_length, so R = L*bond/(2π)
-            R = L * bond_length / (2 * math.pi)
-            # Secondary radius r: A-form helix radius ~13Å (diameter ~26Å)
-            r = 13.0
-            # Number of helical turns: A-form has 11bp/turn, so q = L/11
-            q = L / 11.0
-
+        elif L < 500:
+            # Medium sequence: gentle toroidal helix (fixed q)
+            r = 13.0  # A-form radius
+            q = L / 110.0  # Fixed: gentle z-oscillation (was L/11, too steep)
             for i in range(L):
-                theta = 2 * math.pi * i / L  # Main angle (around torus axis)
-                phi = 2 * math.pi * q * i / L  # Secondary angle (around helix)
+                theta = 2 * math.pi * i / L
+                phi = 2 * math.pi * q * i / L
                 coords[i, 0] = (R + r * math.cos(phi)) * math.cos(theta)
                 coords[i, 1] = (R + r * math.cos(phi)) * math.sin(theta)
                 coords[i, 2] = r * math.sin(phi)
+        else:
+            # Long sequence: pure planar polygon (OpenMM will 3D-ify)
+            for i in range(L):
+                angle = 2 * math.pi * i / L
+                coords[i, 0] = R * math.cos(angle)
+                coords[i, 1] = R * math.sin(angle)
+                coords[i, 2] = 0.0
 
         return coords
 
@@ -192,49 +187,13 @@ class GeometricConstraintSolver:
         if not pair_constraints:
             return coords
 
-        # Filter out BSJ-adjacent pairs (conflict with closure)
-        filtered_pairs = []
-        for (i, j, target_d, weight) in pair_constraints:
-            # Skip pairs that cross or are adjacent to BSJ
-            if (i <= 2 and j >= L - 3) or (j <= 2 and i >= L - 3):
-                continue
-            filtered_pairs.append((i, j, target_d, weight))
-
-        if not filtered_pairs:
-            return coords
-
-        for iteration in range(max_iter):
-            max_error = 0.0
-
-            for (i, j, target_d, weight) in filtered_pairs:
-                # Current distance
-                d_curr = np.linalg.norm(coords[j] - coords[i])
-
-                # Error
-                error = abs(d_curr - target_d)
-                max_error = max(max_error, error)
-
-                if error < 0.5:  # Within tolerance
-                    continue
-
-                # Direction vector from i to j
-                direction = coords[j] - coords[i]
-                if d_curr < 0.01:  # Avoid division by zero
-                    direction = np.random.randn(3)
-                    d_curr = np.linalg.norm(direction)
-
-                direction = direction / d_curr  # normalize
-
-                # Movement amount: proportional to error and weight
-                move_amount = (target_d - d_curr) * weight * 0.3
-                move_amount = np.clip(move_amount, -5.0, 5.0)  # Allow larger moves
-
-                # Move both i and j symmetrically (half each)
-                coords[j] += 0.5 * move_amount * direction
-                coords[i] -= 0.5 * move_amount * direction
-
-            if max_error < 1.0:  # All constraints approximately satisfied
-                break
+        # CRITICAL: Skip pair constraint perturbation entirely.
+        # For circRNA with L > 500, perturbation destroys structure geometry
+        # because even "local" pairs (span <= 50) have ~100A initial distance on ring,
+        # forcing them to 10.6A would collapse local structure.
+        # Let OpenMM handle ALL pair constraints during energy minimization.
+        # This preserves initial ring geometry and allows OpenMM to naturally fold.
+        return coords
 
         return coords
 
@@ -363,39 +322,39 @@ class GeometricConstraintSolver:
 
         return best_coords
 
-    def _has_clashes(self, coords: np.ndarray) -> bool:
-        """Check for steric clashes (vectorized).
+    def _pairwise_dist_sq(self, coords: np.ndarray) -> np.ndarray:
+        """Squared pairwise distance matrix via inner-product expansion.
 
-        Clash: any pair (i, j) where |i-j| > 1 and distance < clash_distance.
-        (Adjacent pairs are bonded, so allowed to be close.)
+        |a-b|² = |a|² + |b|² - 2a·b  — avoids the (L,L,3) intermediate that
+        blows up memory for L~2000 (288 MB → 32 MB for float64).
 
         Returns:
-            True if any clash found
+            (L, L) squared distances, symmetric
         """
+        sq = np.sum(coords ** 2, axis=1)          # (L,)
+        dist_sq = sq[:, np.newaxis] + sq[np.newaxis, :] - 2.0 * coords @ coords.T
+        # Numerical noise can produce tiny negatives for coincident points
+        return np.maximum(dist_sq, 0.0)
+
+    def _has_clashes(self, coords: np.ndarray) -> bool:
+        """Check for steric clashes (vectorized, memory-safe for L~2000)."""
         L = len(coords)
         clash_dist = self.config.clash_distance
 
         if L < 4:
             return False
 
-        # Compute pairwise distance matrix
-        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=2) + 1e-8)
+        dist_sq = self._pairwise_dist_sq(coords)
+        dist_matrix = np.sqrt(dist_sq + 1e-8)
 
-        # Create mask for valid check pairs
         i_idx, j_idx = np.triu_indices(L, k=2)  # |i-j| >= 2
-        # Exclude BSJ pair (0, L-1)
         mask = ~((i_idx == 0) & (j_idx == L - 1))
 
         valid_dists = dist_matrix[i_idx[mask], j_idx[mask]]
         return bool(np.any(valid_dists < clash_dist))
 
     def _count_clashes(self, coords: np.ndarray) -> int:
-        """Count steric clashes (soft version of _has_clashes).
-
-        Same logic as _has_clashes but returns the count of clashing pairs
-        instead of a boolean. Used for soft-scoring long-sequence conformations
-        that would otherwise all be filtered out.
+        """Count steric clashes (soft version, memory-safe for L~2000).
 
         Returns:
             Number of clashing (i,j) pairs
@@ -406,8 +365,8 @@ class GeometricConstraintSolver:
         if L < 4:
             return 0
 
-        diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-        dist_matrix = np.sqrt(np.sum(diff ** 2, axis=2) + 1e-8)
+        dist_sq = self._pairwise_dist_sq(coords)
+        dist_matrix = np.sqrt(dist_sq + 1e-8)
 
         i_idx, j_idx = np.triu_indices(L, k=2)
         mask = ~((i_idx == 0) & (j_idx == L - 1))
@@ -474,11 +433,10 @@ class GeometricConstraintSolver:
             d = np.linalg.norm(coords[j] - coords[i])
             energy += k_pair * weight * (d - target_d) ** 2
 
-        # 3. Clash energy (vectorized with distance matrix)
+        # 3. Clash energy (vectorized, memory-safe for L~2000)
         # Only check non-adjacent pairs (|i-j| > 1) excluding BSJ
         if L > 10:  # Only for longer sequences where clashes matter
-            diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
-            dist_matrix = np.sqrt(np.sum(diff ** 2, axis=2) + 1e-8)
+            dist_matrix = np.sqrt(self._pairwise_dist_sq(coords) + 1e-8)
 
             # Create mask for valid pairs (non-adjacent, not BSJ)
             i_idx, j_idx = np.triu_indices(L, k=2)  # Upper triangle, |i-j| >= 2

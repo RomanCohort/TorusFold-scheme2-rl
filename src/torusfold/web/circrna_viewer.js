@@ -105,6 +105,7 @@
       this.schemeLegend = null;
       this.gradientBar = null;
       this.scalarCards = null;
+      this.statsCards = null;
     }
 
     setStatus(msg) {
@@ -128,74 +129,145 @@
       this.schemeLegend = document.getElementById('scheme-legend');
       this.gradientBar = document.getElementById('gradient-bar');
       this.scalarCards = document.getElementById('scalar-cards');
+      this.statsCards = document.getElementById('stats-cards');
 
-      this._renderScalarCards();
-      this._fillSchemeSelect();
+      // Create viewer if not already created
+      if (!this.viewer) {
+        this.viewer = await molstar.Viewer.create(this.container.id || 'viewer', {
+          layoutIsExpanded: false,
+          viewportShowExpand: true,
+          viewportShowControls: false,
+          viewportShowAnimation: false,
+          viewportShowSettings: false,
+          backgroundColor: { r: 0.06, g: 0.06, b: 0.10 },
+        });
+        this.plugin = this.viewer.plugin;
+      }
 
-      // Mol* 5.x: Viewer.create returns Promise<Viewer>. Do NOT use
-      // `new molstar.Viewer(...)` — that yields a half-initialised viewer
-      // whose plugin.state is undefined → "Cannot read properties of
-      // undefined (reading 'data')".
-      this.viewer = await molstar.Viewer.create(this.container.id || 'viewer', {
-        layoutIsExpanded: false,
-        viewportShowExpand: true,
-        viewportShowControls: false,
-        viewportShowAnimation: false,
-        viewportShowSettings: false,
-        backgroundColor: { r: 0.06, g: 0.06, b: 0.10 },
-      });
-      this.plugin = this.viewer.plugin;
-
-      // First load. 5.x loadStructureFromData 3rd arg accepts only
-      // { dataLabel } — colorTheme is a legacy field, passing it triggers
-      // "Cannot read properties of undefined". Coloring is set separately
-      // via applyColoring AFTER the structure is loaded.
+      // Load structure — just load, no coloring or representation changes
       await this.viewer.loadStructureFromData(pdb, 'pdb', {
         dataLabel: 'circRNA',
       });
       this.structureRef = true;
-      this.setStatus('结构加载完成。');
-
-      // Default: first scheme (usually confidence).
-      if (this.schemeSelect && this.schemeSelect.options.length > 0) {
-        this.schemeSelect.selectedIndex = 0;
-        this.schemeSelect.disabled = false;
-        await this.applyColoring(this.schemeSelect.value);
-        this.schemeSelect.addEventListener('change', () =>
-          this.applyColoring(this.schemeSelect.value)
-        );
-      }
-
-      // Default representation: surface (frosted). mount 后切 surface
-      // 比 cartoon 适合论文配图; 当前 PDB 是粗粒度 P-only 时 surface 会
-      // 退化成散球, 全原子时才是真磨砂面。
       this._surfaceOpacity = 0.35;
       this._currentRepr = null;
-      try {
-        await this.setRepresentation('surface');
-      } catch (e) { console.warn('default surface repr failed:', e); }
 
-      // Hide the placeholder now that the viewer has content.
+      // Hide the placeholder
       const ph = document.getElementById('viewer-placeholder');
       if (ph) ph.style.display = 'none';
+
+      this.setStatus('Structure loaded.');
+
+      // Defer UI updates to avoid state transaction conflicts
+      setTimeout(() => {
+        this._renderScalarCards();
+        this._renderStatsCards();
+        this._fillSchemeSelect();
+      }, 100);
     }
 
     _renderScalarCards() {
       if (!this.scalarCards) return;
       this.scalarCards.innerHTML = '';
       const scalars = (this.fp && this.fp.scalar) || {};
-      const entries = Object.entries(scalars);
+      const signals = (this.fp && this.fp.signals) || {};
+      // Merge: fp.scalar takes priority, then signals
+      const merged = { ...signals, ...scalars };
+      // Keys to skip (nested objects, arrays, duplicates, internal)
+      const skipKeys = new Set([
+        'motif_accessibility', 'stem_loop_stem_lengths', 'stem_loop_loop_lengths',
+        'ies_structural_dev',  // duplicate of circdesign_ires_deviation
+      ]);
+      const entries = Object.entries(merged).filter(([k, v]) => {
+        if (skipKeys.has(k)) return false;
+        if (v === null || v === undefined) return false;
+        if (typeof v === 'object') return false; // skip objects/arrays
+        if (typeof v === 'string' && v.length > 50) return false; // skip long strings
+        return true;
+      });
       if (entries.length === 0) {
-        this.scalarCards.innerHTML = '<div class="legend">无整分子标量数据</div>';
+        this.scalarCards.innerHTML = '<div class="legend">无参数数据</div>';
         return;
       }
+      // 友好名称映射
+      const labels = {
+        energy_cg: 'CG Energy (kJ/mol)',
+        energy_aa: 'All-Atom Energy',
+        pair_rate: 'Pair Rate',
+        cross_segment_ok_rate: 'Cross-Segment OK',
+        n_segments: 'Segments',
+        runtime_seconds: 'Runtime (s)',
+        closure_error: 'Closure Error (Å)',
+        rmsd_to_native: 'RMSD to Native (Å)',
+        n_candidates: 'Candidates',
+        method: 'Method',
+        nlrp3_persistence_length: 'NLRP3 Persistence',
+        sponge_score: 'miRNA Sponge',
+        rigi_score: 'RIG-I Score',
+        closure_distance: 'Closure Distance (Å)',
+        bsj_3d_closure_tightness: 'Closure Tightness',
+        bond_rmsd: 'Bond RMSD (Å)',
+        clash_count: 'Clash Count',
+        dsRNA_fraction: 'dsRNA Fraction',
+        mean_pair_prob: 'Mean Pair Prob',
+        long_range_pair_fraction: 'Long-range Pairs',
+        sasa_mean: 'SASA (mean)',
+        sasa_bsj: 'SASA (BSJ)',
+        ires_3d_accessibility: 'IRES Accessibility',
+        buried_motif_count: 'Buried Motifs',
+        circdesign_mfe: 'MFE (kcal/mol)',
+        circdesign_mfe_per_nt: 'MFE per nt',
+        circdesign_cai: 'CAI',
+        circdesign_ires_deviation: 'IRES Deviation',
+        ies_structural_dev: 'IRES Structural Dev',
+        ires_crosstalk_fraction: 'IRES Cross-talk',
+        ires_length: 'IRES Length (nt)',
+        cds_length: 'CDS Length (nt)',
+        rsrasp1_energy: 'rsRNASP1 Energy',
+        rsrasp1_energy_per_nt: 'rsRNASP1 per nt',
+        stem_loop_count: 'Stem-loop Count',
+        stem_loop_stability: 'Stem-loop ΔG (kcal/mol)',
+        stem_loop_min_stability: 'Min Loop ΔG',
+        stem_loop_max_stability: 'Max Loop ΔG',
+        pdb_file: 'PDB File',
+        pdb_atoms: 'PDB Atoms',
+      };
       for (const [k, v] of entries) {
         const card = document.createElement('div');
         card.className = 'scalar-card';
+        const display = typeof v === 'number' ? v.toFixed(4) : v;
         card.innerHTML =
-          `<div class="k">${k}</div>` +
-          `<div class="v">${typeof v === 'number' ? v.toFixed(3) : v}</div>`;
+          `<div class="k">${labels[k] || k}</div>` +
+          `<div class="v">${display}</div>`;
         this.scalarCards.appendChild(card);
+      }
+    }
+
+    _renderStatsCards() {
+      if (!this.statsCards) return;
+      this.statsCards.innerHTML = '';
+      if (!this.fp) {
+        this.statsCards.innerHTML = '<div class="legend">等待预测...</div>';
+        return;
+      }
+      const stats = [
+        { k: 'Sequence Length', v: (this.fp.length || this.fp.sequence?.length || 0) + ' nt' },
+        { k: 'Method', v: this.fp.method || 'rhofoldcirclong' },
+        { k: 'Closure Error', v: (this.fp.closure_error || 0).toFixed(3) + ' Å' },
+        { k: 'Confidence (avg)', v: this.fp.confidence_avg || '—' },
+      ];
+      const scalars = this.fp.scalar || {};
+      if (scalars.energy_cg !== undefined) stats.push({ k: 'CG Energy', v: scalars.energy_cg.toFixed(1) + ' kJ/mol' });
+      if (scalars.pair_rate !== undefined) stats.push({ k: 'Pair Rate', v: (scalars.pair_rate * 100).toFixed(1) + '%' });
+      if (scalars.cross_segment_ok_rate !== undefined) stats.push({ k: 'Cross-Segment', v: (scalars.cross_segment_ok_rate * 100).toFixed(1) + '%' });
+      if (scalars.n_segments !== undefined) stats.push({ k: 'Segments', v: scalars.n_segments });
+      if (scalars.runtime_seconds !== undefined) stats.push({ k: 'Runtime', v: scalars.runtime_seconds.toFixed(1) + ' s' });
+
+      for (const s of stats) {
+        const card = document.createElement('div');
+        card.className = 'scalar-card';
+        card.innerHTML = `<div class="k">${s.k}</div><div class="v">${s.v}</div>`;
+        this.statsCards.appendChild(card);
       }
     }
 
@@ -402,36 +474,9 @@
     }
 
     async _tryApplyColorTheme(themeName, opts) {
-      if (themeName === 'uncertainty') {
-        // 坑5: remove existing structures BEFORE reload — otherwise they
-        // accumulate and old colors mask new ones.
-        const h = this.plugin.managers.structure.hierarchy;
-        if (h) {
-          const existing = toArr(h.current.structures);
-          if (existing.length > 0) {
-            try {
-              await h.remove(existing, false);
-            } catch (e) {
-              console.warn('remove old structures failed:', e);
-            }
-          }
-        }
-        // 坑4: 3rd arg is { dataLabel } only — no colorTheme.
-        try {
-          await this.viewer.loadStructureFromData(opts.pdb, 'pdb', {
-            dataLabel: 'circRNA',
-          });
-          this.structureRef = true;
-        } catch (e) {
-          this.setStatus('重载结构失败: ' + e.message);
-          return false;
-        }
-        const ok = this._applyColorViaComponent('uncertainty', opts);
-        if (!ok) this.setStatus('uncertainty 主题未生效');
-        return ok;
-      }
-      const ok = this._applyColorViaComponent('uniform', opts);
-      if (!ok) this.setStatus('uniform 主题未生效');
+      // 直接用 component theme, 不重载结构（避免 state transaction 错误）
+      const ok = this._applyColorViaComponent(themeName, opts);
+      if (!ok) this.setStatus(themeName + ' 主题未生效');
       return ok;
     }
 

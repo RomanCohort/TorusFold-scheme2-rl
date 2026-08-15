@@ -80,6 +80,8 @@ def reconstruct_all_atom(
     Returns:
         AllAtomStructure, 每残基全原子坐标 = 1EHZ 标准残基 Kabsch 叠加。
     """
+    # 序列标准化: 大小写 + T→U
+    sequence = sequence.upper().replace("T", "U")
     if p_coords.ndim != 2 or p_coords.shape[1] != 3:
         raise ValueError(f"p_coords 形状异常 {p_coords.shape}, 期望 (L,3)")
     L = len(sequence)

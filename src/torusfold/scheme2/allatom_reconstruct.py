@@ -179,6 +179,8 @@ def reconstruct_all_atom(
     p_coords = np.asarray(p_coords, dtype=np.float64)
     if p_coords.ndim != 2 or p_coords.shape[1] != 3:
         raise ValueError(f"p_coords 期望 (L,3), 实际 {p_coords.shape}")
+    # 序列标准化: 大小写 + T→U
+    sequence = sequence.upper().replace("T", "U")
     L = len(sequence)
     if p_coords.shape[0] != L:
         raise ValueError(f"sequence 长度 {L} != P 点数 {p_coords.shape[0]}")

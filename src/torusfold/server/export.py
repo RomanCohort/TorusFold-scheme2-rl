@@ -289,6 +289,95 @@ def _atom_record_allatom(
     )
 
 
+def _add_signal_coloring(
+    per_residue: dict,
+    schemes: list,
+    coords: Any,
+    sequence: str,
+    signals: dict,
+) -> None:
+    """Generate per-residue coloring arrays derived from 3D coordinates + signals.
+
+    Adds entries to per_residue dict and corresponding coloring_schemes list.
+    These give the user visual feedback on structural quality at each residue.
+    """
+    coords_arr = _take_batch0(coords)
+    L = len(sequence)
+
+    # 1. Per-residue clash density: count atoms within 3.0Å of each P atom
+    clash_density = np.zeros(L, dtype=np.float32)
+    for i in range(L):
+        for j in range(L):
+            if i == j:
+                continue
+            d = np.linalg.norm(coords_arr[i] - coords_arr[j])
+            if d < 3.0:
+                clash_density[i] += 1
+    per_residue["clash_density"] = [_clamp01(float(v / 10.0)) for v in clash_density]
+    schemes.append({"key": "clash_density", "label": "Clash density (3Å)", "type": "per_residue"})
+
+    # 2. Per-residue bond strain: |bond_length - 5.9| / 5.9 for each backbone bond
+    bond_strain = np.zeros(L, dtype=np.float32)
+    for i in range(L):
+        j = (i + 1) % L
+        d = float(np.linalg.norm(coords_arr[i] - coords_arr[j]))
+        bond_strain[i] = abs(d - 5.9) / 5.9
+    per_residue["bond_strain"] = [_clamp01(float(v)) for v in bond_strain]
+    schemes.append({"key": "bond_strain", "label": "Bond strain (vs 5.9Å)", "type": "per_residue"})
+
+    # 3. Per-residue local curvature: angle deviation from 180° at each residue
+    curvature = np.zeros(L, dtype=np.float32)
+    for i in range(L):
+        prev_i = (i - 1) % L
+        next_i = (i + 1) % L
+        v1 = coords_arr[prev_i] - coords_arr[i]
+        v2 = coords_arr[next_i] - coords_arr[i]
+        n1 = np.linalg.norm(v1)
+        n2 = np.linalg.norm(v2)
+        if n1 > 1e-6 and n2 > 1e-6:
+            cos_angle = np.clip(np.dot(v1, v2) / (n1 * n2), -1, 1)
+            angle_deg = np.degrees(np.arccos(cos_angle))
+            curvature[i] = abs(angle_deg - 180.0) / 180.0  # 0=straight, 1=sharp turn
+    per_residue["local_curvature"] = [_clamp01(float(v)) for v in curvature]
+    schemes.append({"key": "local_curvature", "label": "Local curvature", "type": "per_residue"})
+
+    # 4. Per-residue distance to BSJ (first residue): normalised
+    if L > 1:
+        bsj_dist = np.zeros(L, dtype=np.float32)
+        ref = coords_arr[0]
+        max_d = 1.0
+        for i in range(L):
+            bsj_dist[i] = float(np.linalg.norm(coords_arr[i] - ref))
+        max_d = max(float(bsj_dist.max()), 1.0)
+        per_residue["distance_to_bsj"] = [_clamp01(float(v / max_d)) for v in bsj_dist]
+        schemes.append({"key": "distance_to_bsj", "label": "Distance to BSJ", "type": "per_residue"})
+
+    # 5. Per-residue contact density (8Å): how many neighbors within 8Å
+    contact_density = np.zeros(L, dtype=np.float32)
+    for i in range(L):
+        for j in range(L):
+            if i != j and float(np.linalg.norm(coords_arr[i] - coords_arr[j])) < 8.0:
+                contact_density[i] += 1
+    max_cd = max(float(contact_density.max()), 1.0)
+    per_residue["contact_density_8a"] = [_clamp01(float(v / max_cd)) for v in contact_density]
+    schemes.append({"key": "contact_density_8a", "label": "Contact density (8Å)", "type": "per_residue"})
+
+    # 6. Scalar signals as uniform-colored options
+    scalar_signals = [
+        ("closure_distance", "Closure distance"),
+        ("bond_rmsd", "Bond RMSD"),
+        ("circdesign_mfe", "MFE (kcal/mol)"),
+        ("circdesign_cai", "CAI"),
+        ("circdesign_ires_deviation", "IRES deviation"),
+        ("stem_loop_stability", "Stem-loop ΔG"),
+        ("stem_loop_count", "Stem-loop count"),
+    ]
+    for key, label in scalar_signals:
+        if key in signals and signals[key] is not None:
+            per_residue[f"__scalar_{key}"] = [float(signals[key])] * L
+            schemes.append({"key": f"__scalar_{key}", "label": f"{label} (scalar)", "type": "scalar"})
+
+
 def fingerprints_to_json(
     coords: Any,
     sequence: str,
@@ -297,6 +386,7 @@ def fingerprints_to_json(
     per_residue_keys: Optional[Sequence[str]] = None,
     scalar_keys: Optional[Sequence[str]] = None,
     pairs: Optional[Sequence[tuple]] = None,
+    signals: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     把免疫指纹 + confidence 整理成前端 coloring 用的 JSON 结构。
@@ -431,6 +521,15 @@ def fingerprints_to_json(
             "label": label_map.get(k, k) + " (scalar)",
             "type": "scalar",
         })
+
+    # --- Signals-based coloring: derive per-residue arrays from 3D coords ---
+    if signals is not None and coords_arr is not None and L > 1:
+        try:
+            _add_signal_coloring(per_residue, schemes, coords_arr, sequence, signals)
+        except Exception as exc:
+            import traceback
+            print(f"[export] _add_signal_coloring FAILED: {exc}")
+            traceback.print_exc()
 
     return {
         "sequence": sequence,

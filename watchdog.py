@@ -66,14 +66,29 @@ def start_process():
 
 
 def kill_process():
-    """杀掉所有 Python 子进程."""
+    """只杀数据生成进程 (generate_data_rhofold.py), 不杀 watchdog 自己."""
     try:
-        subprocess.run(
-            ["taskkill", "/F", "/IM", "python.exe"],
-            capture_output=True, timeout=10
+        # 找到 generate_data_rhofold.py 的进程 PID
+        r = subprocess.run(
+            ["wmic", "process", "where",
+             "CommandLine like '%generate_data_rhofold%' and Name='python.exe'",
+             "get", "ProcessId"],
+            capture_output=True, text=True, timeout=10
         )
-    except Exception:
-        pass
+        pids = []
+        for line in r.stdout.split("\n"):
+            line = line.strip()
+            if line.isdigit():
+                pids.append(int(line))
+        for pid in pids:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, timeout=10)
+        if pids:
+            print(f"  杀掉进程: {pids}")
+        else:
+            print("  没找到数据生成进程")
+    except Exception as e:
+        print(f"  杀进程失败: {e}")
 
 
 def main():
